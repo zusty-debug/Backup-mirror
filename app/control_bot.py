@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
@@ -12,7 +13,7 @@ from telethon.sessions import StringSession
 
 from .config import Settings
 from .database import Database
-from .models import Project, ProjectSettings, ProjectStatus, ScanMode
+from .models import MediaType, Project, ProjectSettings, ProjectStatus, ScanMode
 from .reports import build_project_report
 from .telegram_gateway import ProfileNotConnectedError, TelegramGateway, TelegramGatewayError
 from .utils import readable_bytes, truncate
@@ -50,6 +51,7 @@ class TelegramControlBot:
             app_version="0.1.0",
         )
         self.flows: dict[int, Flow] = {}
+        self.plan_scan_tasks: dict[str, asyncio.Task[None]] = {}
         self.client.add_event_handler(self._on_message, events.NewMessage(incoming=True))
         self.client.add_event_handler(self._on_callback, events.CallbackQuery())
 
@@ -135,6 +137,9 @@ class TelegramControlBot:
             await event.answer(f"Error: {truncate(str(exc), 120)}", alert=True)
 
     async def _handle_callback(self, event: events.CallbackQuery.Event, user_id: int, data: str) -> None:
+        if data == "noop":
+            await event.answer("Scan is in progress")
+            return
         if data == "account:connect":
             await event.answer()
             await self._begin_connect(event)
@@ -171,6 +176,10 @@ class TelegramControlBot:
             await event.answer()
             await self._choose_forum_topics(event, user_id, data)
             return
+        if data.startswith("filter:"):
+            await event.answer()
+            await self._toggle_media_filter(event, user_id, data)
+            return
         if data.startswith("content:"):
             await event.answer()
             await self._choose_content(event, user_id, data)
@@ -190,7 +199,7 @@ class TelegramControlBot:
             return
         project_actions = {
             "confirm", "cancel", "view", "start", "pause", "stopask", "stop", "status",
-            "settings", "caption", "sync", "report", "failed", "activity", "verify", "preview", "retry",
+            "settings", "mediafilter", "caption", "sync", "report", "failed", "activity", "verify", "preview", "retry",
             "duplicate", "deleteask", "delete",
         }
         if action in project_actions and not project:
@@ -285,35 +294,23 @@ class TelegramControlBot:
                 await event.answer(f"Verification failed: {truncate(str(exc), 90)}", alert=True)
             await self._edit_project(event, self.database.get_project(project.id, user_id))
         elif action == "preview":
-            await event.answer("Running read-only preview scan…")
-            try:
-                counts = await self.workers.worker.preview(project.id)
-                total = counts.pop("TOTAL", 0)
-                scanned = counts.pop("SCANNED", 0)
-                self.database.save_project_plan(project.id, scanned, total, counts)
-                breakdown = "\n".join(
-                    f"• {self._esc(kind.title().replace('_', ' '))}: {amount:,}"
-                    for kind, amount in sorted(counts.items())
-                )
-                text = (
-                    f"<b>🧮 Sending plan ready — {self._esc(project.name)}</b>\n\n"
-                    f"🔎 Source messages scanned: {scanned:,}\n"
-                    f"📦 Valid selected messages: <b>{total:,}</b>\n\n"
-                    f"{breakdown or 'No selected content found.'}\n\n"
-                    "No messages have been sent. Review the total, then press Start Sending."
-                )
-                self.database.log_event(project.id, "INFO", f"Sending plan approved: {total} selected items")
-                await self._edit_reply(
-                    event,
-                    text,
-                    buttons=[
-                        [Button.inline(f"▶️ Start Sending {total:,} Items", f"start:{project.id}".encode())],
-                        [Button.inline("🔍 Scan Again", f"preview:{project.id}".encode()), Button.inline("⬅️ Project", f"view:{project.id}".encode())],
-                    ],
-                )
-            except Exception as exc:
-                self.database.log_event(project.id, "ERROR", f"Preview failed: {exc}")
-                await event.answer(f"Preview failed: {truncate(str(exc), 90)}", alert=True)
+            existing = self.plan_scan_tasks.get(project.id)
+            if existing and not existing.done():
+                await event.answer("Source scan is already running")
+                return
+            await event.answer("Started live source scan")
+            await self._edit_reply(
+                event,
+                f"<b>🧮 Scanning selected content — {self._esc(project.name)}</b>\n\n"
+                "Preparing source scan…\n\n"
+                "No messages will be sent until you approve the final total.",
+                buttons=[[Button.inline("⏳ Scan in progress", b"noop")]],
+            )
+            task = asyncio.create_task(
+                self._run_plan_scan(project.id, int(event.chat_id), int(event.message_id)),
+                name=f"plan-scan-{project.id}",
+            )
+            self.plan_scan_tasks[project.id] = task
         elif action == "activity":
             rows = self.database.recent_events(project.id)
             lines = [f"<b>📜 Activity — {self._esc(project.name)}</b>", ""]
@@ -355,6 +352,9 @@ class TelegramControlBot:
             )
             await event.answer("Project configuration duplicated")
             await self._edit_project(event, self.database.get_project(clone.id, user_id))
+        elif action == "mediafilter":
+            await event.answer()
+            await self._edit_media_filters(event, project)
         elif action == "settings":
             await event.answer()
             await self._edit_settings(event, project)
@@ -822,6 +822,86 @@ class TelegramControlBot:
         projects = self.database.list_projects(user_id)
         await self._edit_reply(event, "<b>My Projects</b>" if projects else "No projects yet.", parse_mode="html", buttons=self._projects_buttons(projects))
 
+    async def _run_plan_scan(self, project_id: str, chat_id: int, message_id: int) -> None:
+        project = self.database.get_project(project_id)
+        if not project:
+            return
+        last_edit = 0.0
+
+        async def update(phase: str, scanned: int, source_total: int, selected: int) -> None:
+            nonlocal last_edit
+            now = time.monotonic()
+            if now - last_edit < 2 and scanned != source_total:
+                return
+            if source_total:
+                percentage = 100 * scanned / source_total
+                filled = round(10 * percentage / 100)
+                bar = "▰" * filled + "▱" * (10 - filled)
+                scan_line = f"{bar} {percentage:.1f}%\n🔎 Source messages checked: {scanned:,} / {source_total:,}"
+            else:
+                scan_line = f"▰▰▰▱▱▱▱▱▱▱ counting…\n🔎 Source messages counted: {scanned:,}"
+            text = (
+                f"<b>🧮 Scanning selected content — {self._esc(project.name)}</b>\n\n"
+                f"📍 Phase: {self._esc(phase)}\n"
+                f"{scan_line}\n"
+                f"📦 Valid selected messages found: {selected:,}\n\n"
+                "No messages have been sent."
+            )
+            try:
+                await self.client.edit_message(
+                    chat_id,
+                    message_id,
+                    self._brand(text),
+                    parse_mode="html",
+                    buttons=[[Button.inline("⏳ Scan in progress", b"noop")]],
+                )
+            except errors.MessageNotModifiedError:
+                pass
+            last_edit = now
+
+        try:
+            counts = await self.workers.worker.preview(project.id, progress_callback=update)
+            total = counts.pop("TOTAL", 0)
+            scanned = counts.pop("SCANNED", 0)
+            self.database.save_project_plan(project.id, scanned, total, counts)
+            breakdown = "\n".join(
+                f"• {self._esc(kind.title().replace('_', ' '))}: {amount:,}"
+                for kind, amount in sorted(counts.items())
+            )
+            text = (
+                f"<b>✅ Sending plan ready — {self._esc(project.name)}</b>\n\n"
+                f"🔎 Source messages scanned: {scanned:,}\n"
+                f"📦 Valid selected messages: <b>{total:,}</b>\n\n"
+                f"{breakdown or 'No selected content found.'}\n\n"
+                "No messages have been sent. Review the total, then press Start Sending."
+            )
+            self.database.log_event(project.id, "INFO", f"Sending plan approved: {total} selected items")
+            await self.client.edit_message(
+                chat_id,
+                message_id,
+                self._brand(text),
+                parse_mode="html",
+                buttons=[
+                    [Button.inline(f"▶️ Start Sending {total:,} Items", f"start:{project.id}".encode())],
+                    [Button.inline("🔍 Scan Again", f"preview:{project.id}".encode()), Button.inline("⬅️ Project", f"view:{project.id}".encode())],
+                ],
+            )
+        except Exception as exc:
+            self.database.log_event(project.id, "ERROR", f"Plan scan failed: {exc}")
+            error_text = (
+                f"<b>❌ Scan failed — {self._esc(project.name)}</b>\n\n"
+                f"<code>{self._esc(truncate(str(exc), 240))}</code>"
+            )
+            await self.client.edit_message(
+                chat_id,
+                message_id,
+                self._brand(error_text),
+                parse_mode="html",
+                buttons=[[Button.inline("🔍 Try Scan Again", f"preview:{project.id}".encode())]],
+            )
+        finally:
+            self.plan_scan_tasks.pop(project_id, None)
+
     async def _edit_live_status(self, event, project: Project) -> None:
         counters = self.database.counters(project.id)
         progress = self.workers.live_progress(project.id)
@@ -842,13 +922,18 @@ class TelegramControlBot:
             progress_line = f"{bar} {percentage:.1f}%\n📊 {processed:,} / {total:,} processed"
         else:
             progress_line = f"📊 {processed:,} processed"
+        rate_line = ""
+        if progress and progress.rate_wait_total is not None and progress.rate_wait_remaining is not None:
+            wait_pct = 100 * (progress.rate_wait_total - progress.rate_wait_remaining) / max(1, progress.rate_wait_total)
+            wait_bar = "▰" * round(10 * wait_pct / 100) + "▱" * (10 - round(10 * wait_pct / 100))
+            rate_line = f"\n🛡️ Pace timer: {wait_bar} {wait_pct:.1f}%\n⏳ Resumes in: {progress.rate_wait_remaining}s"
         state = "🛡️ Telegram pace protection" if project.status == ProjectStatus.WAITING_RATE_LIMIT else project.status.value
         text = (
             "<b>📡 Live backup status</b>\n"
             f"📁 Project: <b>{self._esc(project.name)}</b>\n"
             f"🔄 State: <code>{state}</code>\n"
             f"📍 Phase: {self._esc(phase)}\n\n"
-            f"{progress_line}\n"
+            f"{progress_line}{rate_line}\n"
             f"✅ Sent: {counters.completed:,}\n"
             f"♻️ Already copied: {progress.skipped if progress else 0:,}\n"
             f"⚠️ Failed: {counters.failed:,}\n"
@@ -996,6 +1081,50 @@ class TelegramControlBot:
             [Button.inline("📂 My Projects", b"project:list"), Button.inline("🛠️ Admin", b"admin")],
         ]
 
+    @staticmethod
+    def _media_filter_types() -> list[tuple[MediaType, str]]:
+        return [
+            (MediaType.DOCUMENT, "📄 Files"),
+            (MediaType.PHOTO, "🖼️ Photos"),
+            (MediaType.VIDEO, "🎬 Videos"),
+            (MediaType.AUDIO, "🎵 Audio"),
+            (MediaType.VOICE, "🎙️ Voice"),
+            (MediaType.VIDEO_NOTE, "⭕ Video notes"),
+            (MediaType.GIF, "🌀 GIFs"),
+            (MediaType.STICKER, "🎭 Stickers"),
+        ]
+
+    async def _edit_media_filters(self, event, project: Project) -> None:
+        enabled = {str(item) for item in project.settings.media_types}
+        rows = []
+        for media_type, label in self._media_filter_types():
+            mark = "✅" if media_type.value in enabled else "⬜"
+            rows.append([Button.inline(f"{mark} {label}", f"filter:{media_type.value}:{project.id}".encode())])
+        rows.append([Button.inline("⬅️ Settings", f"settings:{project.id}".encode())])
+        await self._edit_reply(
+            event,
+            f"<b>🎛️ Media Filters — {self._esc(project.name)}</b>\n\n"
+            "Choose exactly which media/file types the plan scan and transfer should include. Changing filters clears the current sending plan.",
+            buttons=rows,
+        )
+
+    async def _toggle_media_filter(self, event: events.CallbackQuery.Event, user_id: int, data: str) -> None:
+        _, media_value, project_id = data.split(":", 2)
+        project = self.database.get_project(project_id, user_id)
+        if not project:
+            await event.answer("Project not found", alert=True)
+            return
+        values = [str(item) for item in project.settings.media_types]
+        if media_value in values:
+            if len(values) == 1:
+                await event.answer("Keep at least one media type enabled", alert=True)
+                return
+            values.remove(media_value)
+        else:
+            values.append(media_value)
+        self.database.update_project_settings(project.id, replace(project.settings, media_types=values))
+        await self._edit_media_filters(event, self.database.get_project(project.id, user_id))
+
     async def _edit_settings(self, event, project: Project) -> None:
         settings = project.settings
         text = (
@@ -1014,6 +1143,7 @@ class TelegramControlBot:
             text,
             parse_mode="html",
             buttons=[
+                [Button.inline("🎛️ Media Filters", f"mediafilter:{project.id}".encode())],
                 [Button.inline(f"📝 Captions: {'On' if settings.preserve_captions else 'Off'}", f"caption:{project.id}".encode())],
                 [Button.inline(f"🔄 Sync: {'On' if settings.continuous_sync else 'Off'}", f"sync:{project.id}".encode())],
                 [Button.inline("⬅️ Back", f"view:{project.id}".encode())],

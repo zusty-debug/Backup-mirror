@@ -344,9 +344,11 @@ Content selection is now multi-select instead of a single fixed choice.
 
 ## 19. Live status refresh, progress bar, and rate-protection wording
 
-### Scan → approval → send workflow
+### Live scanning, approval, and send workflow
 
-A project now uses a deliberate two-step workflow:
+The source-planning screen now updates automatically every two seconds. It performs a first source-range count, then a valid-content count using the exact transfer selection. The user sees an indeterminate counting bar first, followed by a real percentage bar once the source-range total is known.
+
+A project then uses a deliberate two-step workflow:
 
 ```text
 🔍 Scan Selected Content
@@ -360,6 +362,30 @@ The scan result is stored in `project_plans`, including scanned source count, ap
 If a project has not been scanned, pressing Start prompts the user to scan first rather than sending immediately.
 
 `Skipped` is now shown as `Already copied (resume protection)`, clarifying that it only applies to durable restart/retry deduplication and not to newly approved source messages.
+
+### Delivery pace and live updates
+
+- Default send target: `MAX_SENDS_PER_MINUTE=100`.
+- The worker paces fresh media, text/link messages, and album sends before each destination operation.
+- Live backup cards update at most every two seconds, including during Telegram pacing waits.
+- FloodWait is presented as `🛡️ Telegram pace protection`, not as a project error.
+- During a FloodWait, two separate bars are shown: overall approved-message progress and a countdown bar for Telegram's pacing window.
+- Every live backup card retains a `🔄 Refresh Live Status` button for an immediate snapshot, while automatic updates continue every two seconds.
+
+### Detailed media filters
+
+The project Settings page now includes `🎛️ Media Filters`, allowing a user to enable/disable independently:
+
+- Files/documents;
+- photos;
+- videos;
+- audio;
+- voice messages;
+- video notes;
+- GIFs;
+- stickers.
+
+Changing a media filter clears the previous plan so the user must scan and approve the new exact total.
 
 ### Direct topic-thread retrieval
 

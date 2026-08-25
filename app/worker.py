@@ -32,6 +32,9 @@ class ScanProgress:
     phase: str = "🚀 Preparing"
     total_eligible: int | None = None
     counted_messages: int = 0
+    rate_wait_total: int | None = None
+    rate_wait_remaining: int | None = None
+    last_send_at: float = 0.0
     started_at: float = field(default_factory=time.monotonic)
 
 
@@ -148,37 +151,52 @@ class BackupWorker:
             self.gateway.entity_name(destination),
         )
 
-    async def preview(self, project_id: str) -> dict[str, int]:
-        """Read-only plan scan using the exact same source selection as transfer."""
+    async def preview(self, project_id: str, progress_callback=None) -> dict[str, int]:
+        """Read-only two-pass plan scan using the exact transfer selection."""
         project = self._reload(project_id)
-        counts: dict[str, int] = {}
-        scanned = 0
         async with self.gateway.client_for_profile(project.profile_id) as client:
             source = await self.gateway.resolve_entity(client, project.source_ref)
-            if getattr(source, "forum", False) and project.settings.forum_to_channel_segments:
-                topic_ids = [int(topic_id) for topic_id in project.settings.forum_topic_ids]
-                for topic_id in topic_ids:
-                    async for message in client.iter_messages(source, reverse=True, reply_to=topic_id):
-                        if not self._within_date_range(project, message):
-                            continue
-                        scanned += 1
-                        kind = self._eligible_media(project, message)
-                        if kind:
-                            counts[kind.value] = counts.get(kind.value, 0) + 1
-            else:
-                checkpoint = project.checkpoint_message_id or 0
-                min_id = max(checkpoint, (project.start_message_id or 1) - 1)
-                async for message in client.iter_messages(source, reverse=True, min_id=min_id):
-                    if not self._within_date_range(project, message) or not self._message_in_selected_topic(project, message):
-                        continue
-                    scanned += 1
-                    kind = self._eligible_media(project, message)
-                    if kind:
-                        counts[kind.value] = counts.get(kind.value, 0) + 1
+            # First pass obtains a real denominator for the live scanning bar.
+            source_total = 0
+            last_count_update = 0.0
+            async for _ in self._iter_selected_source_messages(project, client, source):
+                source_total += 1
+                now = time.monotonic()
+                if progress_callback and now - last_count_update >= 2:
+                    await progress_callback("🧮 Counting selected source range", source_total, 0, 0)
+                    last_count_update = now
+            if progress_callback:
+                await progress_callback("🧮 Counting valid selected content", 0, source_total, 0)
+            counts: dict[str, int] = {}
+            scanned = 0
+            last_update = 0.0
+            async for message in self._iter_selected_source_messages(project, client, source):
+                scanned += 1
+                kind = self._eligible_media(project, message)
+                if kind:
+                    counts[kind.value] = counts.get(kind.value, 0) + 1
+                now = time.monotonic()
+                if progress_callback and (now - last_update >= 2 or scanned == source_total):
+                    await progress_callback("🔎 Scanning selected source", scanned, source_total, sum(counts.values()))
+                    last_update = now
         counts["SCANNED"] = scanned
         counts["TOTAL"] = sum(value for key, value in counts.items() if key != "SCANNED")
         self.database.log_event(project.id, "INFO", f"Preview plan scan: {counts['TOTAL']} selected items found")
         return counts
+
+    async def _iter_selected_source_messages(self, project: Project, client, source):
+        """Yield messages selected by the project with the same logic used for sending."""
+        if getattr(source, "forum", False) and project.settings.forum_to_channel_segments:
+            for topic_id in [int(item) for item in project.settings.forum_topic_ids]:
+                async for message in client.iter_messages(source, reverse=True, reply_to=topic_id):
+                    if self._within_date_range(project, message):
+                        yield message
+            return
+        checkpoint = project.checkpoint_message_id or 0
+        min_id = max(checkpoint, (project.start_message_id or 1) - 1)
+        async for message in client.iter_messages(source, reverse=True, min_id=min_id):
+            if self._within_date_range(project, message) and self._message_in_selected_topic(project, message):
+                yield message
 
     async def _run_single_pass(self, project: Project, progress: ScanProgress) -> None:
         if project.source_chat_id is None or project.destination_chat_id is None:
@@ -485,6 +503,7 @@ class BackupWorker:
                         status=TransferStatus.UPLOADING,
                     )
                 captions = [message.message or "" if project.settings.preserve_captions else "" for message, _ in group]
+                await self._pace_before_send(progress, len(group))
                 sent = await client.send_file(
                     destination,
                     [message.media for message, _ in group],
@@ -549,6 +568,7 @@ class BackupWorker:
                 for item in files:
                     self.database.mark_transfer(project.id, int(project.source_chat_id), int(item.message.id), TransferStatus.UPLOADING)
                 captions = [item.caption or "" for item in files]
+                await self._pace_before_send(progress, len(files))
                 sent = await client.send_file(
                     destination,
                     [str(item.path) for item in files],
@@ -642,6 +662,7 @@ class BackupWorker:
                     file_size=len(text.encode("utf-8")),
                     status=TransferStatus.UPLOADING,
                 )
+                await self._pace_before_send(progress)
                 sent = await client.send_message(
                     destination,
                     text,
@@ -701,6 +722,15 @@ class BackupWorker:
                 links.append(str(url))
         return "\n".join(dict.fromkeys(links))
 
+    async def _pace_before_send(self, progress: ScanProgress, units: int = 1) -> None:
+        """Maintain a conservative per-message delivery pace for public workers."""
+        interval = 60 / self.settings.max_sends_per_minute
+        target = progress.last_send_at + interval * max(1, units)
+        delay = target - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        progress.last_send_at = time.monotonic()
+
     async def _server_copy_with_retry(
         self,
         project: Project,
@@ -734,6 +764,7 @@ class BackupWorker:
                     status=TransferStatus.UPLOADING,
                 )
                 caption = message.message or "" if project.settings.preserve_captions else None
+                await self._pace_before_send(progress)
                 sent = await client.send_file(
                     destination,
                     message.media,
@@ -796,6 +827,7 @@ class BackupWorker:
             try:
                 item = await self._download_media(project, client, message, media_type, progress)
                 self.database.mark_transfer(project.id, int(project.source_chat_id), int(message.id), TransferStatus.UPLOADING)
+                await self._pace_before_send(progress)
                 sent = await client.send_file(
                     destination,
                     str(item.path),
@@ -931,24 +963,28 @@ class BackupWorker:
         seconds = max(1, int(seconds))
         self.database.update_project_status(project.id, ProjectStatus.WAITING_RATE_LIMIT)
         progress.phase = "🛡️ Telegram pace protection"
+        progress.rate_wait_total = seconds
+        progress.rate_wait_remaining = seconds
         progress.current_file = f"Telegram is pacing sends — resuming in {seconds}s"
         await self._status(project, progress, force=True)
         self.database.log_event(project.id, "INFO", f"Telegram pace protection active: waiting {seconds} seconds")
         remaining = seconds
         last_refresh = seconds
         while remaining > 0:
-            await asyncio.sleep(min(remaining, 5))
-            remaining = max(0, remaining - 5)
+            await asyncio.sleep(min(remaining, 2))
+            remaining = max(0, remaining - 2)
+            progress.rate_wait_remaining = remaining
             state = self._reload(project.id).status
             if state in {ProjectStatus.PAUSE_REQUESTED, ProjectStatus.STOP_REQUESTED}:
                 return True
-            # Refresh the user-facing countdown every 15 seconds without
-            # over-editing Telegram status messages.
-            if last_refresh - remaining >= 15 or remaining == 0:
+            # Refresh countdown and both progress bars every two seconds.
+            if last_refresh - remaining >= 2 or remaining == 0:
                 progress.current_file = f"Telegram is pacing sends — resuming in {remaining}s"
                 await self._status(project, progress, force=True)
                 last_refresh = remaining
         self.database.update_project_status(project.id, ProjectStatus.RUNNING)
+        progress.rate_wait_total = None
+        progress.rate_wait_remaining = None
         progress.phase = "⚡ Sending fresh Telegram media"
         return False
 
@@ -984,14 +1020,16 @@ class BackupWorker:
         if not project.status_message_chat_id or not project.status_message_id:
             return
         now = time.monotonic()
-        if not force and now - self._last_status.get(project.id, 0) < self.settings.status_update_seconds:
+        status_interval = min(2, self.settings.status_update_seconds)
+        if not force and now - self._last_status.get(project.id, 0) < status_interval:
             return
         self._last_status[project.id] = now
         counters = self.database.counters(project.id)
         elapsed = max(time.monotonic() - progress.started_at, 0.001)
         speed = progress.bytes_this_run / elapsed
-        state = self._reload(project.id).status.value
-        title = "✅ Backup completed" if final and state == ProjectStatus.COMPLETED.value else "📡 Live backup status"
+        raw_state = self._reload(project.id).status.value
+        state = "🛡️ Telegram pace protection" if raw_state == ProjectStatus.WAITING_RATE_LIMIT.value else raw_state
+        title = "✅ Backup completed" if final and raw_state == ProjectStatus.COMPLETED.value else "📡 Live backup status"
         elapsed_text = self._readable_duration(elapsed)
         copied_or_skipped = counters.completed + progress.skipped
         progress_line = f"{copied_or_skipped:,} processed"
@@ -1006,6 +1044,13 @@ class BackupWorker:
             eta_line = f"⏳ ETA: {self._readable_duration(remaining / item_rate)}" if item_rate > 0 else "⏳ ETA: calculating…"
         elif progress.phase.startswith("🧮"):
             eta_line = f"🧮 Count scan: {progress.counted_messages:,} source messages checked"
+        rate_bar_line = ""
+        if progress.rate_wait_total is not None and progress.rate_wait_remaining is not None:
+            wait_elapsed_pct = 100 * (progress.rate_wait_total - progress.rate_wait_remaining) / max(1, progress.rate_wait_total)
+            rate_bar_line = (
+                f"🛡️ Pace timer: {self._progress_bar(wait_elapsed_pct)} {wait_elapsed_pct:.1f}%\n"
+                f"⏳ Telegram resumes in: {self._readable_duration(progress.rate_wait_remaining)}\n"
+            )
         text = (
             f"<b>{title}</b>\n"
             f"📁 Project: <b>{self._escape(project.name)}</b>\n"
@@ -1013,6 +1058,7 @@ class BackupWorker:
             f"📍 Phase: {self._escape(progress.phase)}\n\n"
             f"📊 Progress: {progress_line}\n"
             f"{progress_bar + chr(10) if progress_bar else ''}"
+            f"{rate_bar_line}"
             f"🔎 Source messages scanned: {progress.scanned:,}\n"
             f"🎞️ Media/files found: {progress.eligible:,}\n"
             f"✅ Sent: {counters.completed:,}\n"
