@@ -157,6 +157,8 @@ class BackupWorker:
             async for message in client.iter_messages(source, reverse=True, min_id=min_id):
                 if not self._within_date_range(project, message):
                     continue
+                if not self._message_in_selected_topic(project, message):
+                    continue
                 progress.scanned += 1
                 grouped_id = getattr(message, "grouped_id", None)
                 if album and grouped_id != album_key:
@@ -180,6 +182,16 @@ class BackupWorker:
                 await self._process_batch(project, client, destination, album, progress)
                 self.database.update_project_checkpoint(project.id, int(album[-1].id))
 
+    @staticmethod
+    def _message_in_selected_topic(project: Project, message: Message) -> bool:
+        selected = {int(topic_id) for topic_id in project.settings.forum_topic_ids}
+        if not selected:
+            return True
+        reply = getattr(message, "reply_to", None)
+        topic_id = getattr(reply, "reply_to_top_id", None) if reply else None
+        # The General topic may not carry a top-message reference on every message.
+        return bool(topic_id and int(topic_id) in selected)
+
     async def _ensure_forum_topics(self, project: Project, client, source, destination, progress: ScanProgress) -> None:
         if not getattr(source, "forum", False):
             return
@@ -198,19 +210,25 @@ class BackupWorker:
                 q=None,
             )
         )
+        selected_topic_ids = {int(topic_id) for topic_id in project.settings.forum_topic_ids}
         for topic in getattr(result, "topics", []):
             source_topic_id = int(topic.id)
+            if selected_topic_ids and source_topic_id not in selected_topic_ids:
+                continue
             if self.database.destination_topic_id(project.id, source_topic_id):
                 continue
             # Telegram's General topic exists automatically in every forum.
             if source_topic_id == 1:
                 self.database.save_forum_topic(project.id, 1, 1, getattr(topic, "title", "General"))
                 continue
+            title = str(getattr(topic, "title", None) or "Topic")
             created = await client(
                 functions.messages.CreateForumTopicRequest(
                     peer=destination,
-                    title=getattr(topic, "title", "Topic"),
-                    icon_color=getattr(topic, "icon_color", None),
+                    title=title,
+                    # Telegram accepts a normal icon colour even if the source topic
+                    # has no custom icon metadata.
+                    icon_color=getattr(topic, "icon_color", None) or 0x6FB9F0,
                     icon_emoji_id=getattr(topic, "icon_emoji_id", None),
                 )
             )
@@ -221,13 +239,25 @@ class BackupWorker:
                     destination_topic_id = int(created_message.id)
                     break
             if destination_topic_id is None:
-                raise TelegramGatewayError(f"Unable to map forum topic: {getattr(topic, 'title', source_topic_id)}")
-            self.database.save_forum_topic(
-                project.id,
-                source_topic_id,
-                destination_topic_id,
-                getattr(topic, "title", None),
-            )
+                # Some Telegram update forms omit the created message object. Refresh
+                # destination topics and match the newly created title as a fallback.
+                destination_topics = await client(
+                    functions.messages.GetForumTopicsRequest(
+                        peer=destination,
+                        offset_date=None,
+                        offset_id=0,
+                        offset_topic=0,
+                        limit=100,
+                        q=title,
+                    )
+                )
+                for destination_topic in getattr(destination_topics, "topics", []):
+                    if getattr(destination_topic, "title", None) == title:
+                        destination_topic_id = int(destination_topic.id)
+                        break
+            if destination_topic_id is None:
+                raise TelegramGatewayError(f"Unable to map forum topic: {title}")
+            self.database.save_forum_topic(project.id, source_topic_id, destination_topic_id, title)
 
     @staticmethod
     def _within_date_range(project: Project, message: Message) -> bool:

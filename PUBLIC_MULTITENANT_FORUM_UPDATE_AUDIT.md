@@ -270,14 +270,48 @@ Existing test coverage verifies:
 
 ---
 
-## 15. Test plan for live Telegram validation
+## 15. Forum failure visibility and hardened topic mapping update
+
+After a forum-clone run reported failure during `🧵 Matching forum topics`, the project card was updated to expose the recorded `last_error` directly in the bot UI. This makes future setup failures visible without requiring server-log access.
+
+Topic-clone mapping was hardened by:
+
+- using a normal fallback icon colour when a source topic has no custom icon colour;
+- extracting the destination topic root message from Telegram update results when present;
+- querying destination topics by title as a fallback when Telegram returns an update form without a root message;
+- retaining the durable topic mapping only after a destination topic ID is found.
+
+## 16. Forum topic selection update
+
+When a user enters a forum source, the bot now lists the accessible topics before destination setup.
+
+The user can:
+
+1. tap one or more topic buttons;
+2. use `✅ Select all` if required;
+3. tap `➡️ Done`;
+4. send `CREATE_FORUM` to create the selected-topic clone.
+
+Only selected source topic IDs are cloned/mapped and processed. The selected IDs are saved in project settings and enforced during the source scan.
+
+## 17. Multi-select content update
+
+Content selection is now multi-select instead of a single fixed choice.
+
+- Files, Media, and Links can be selected in any combination.
+- `Everything` is an exclusive all-content choice.
+- The selection screen shows `✅` / `⬜` state for each category.
+- `➡️ Done` derives the effective content mode automatically.
+
+## 18. Test plan for live Telegram validation
 
 1. Use a second Telegram account to open the public bot and verify it receives the onboarding menu.
 2. Connect a distinct worker account and verify it cannot view another user's projects.
 3. Create each content-mode project against a small private test chat.
-4. Verify Files, Media, Links, and Everything modes separately.
+4. Verify Files, Media, Links, multi-select combinations, and Everything separately.
 5. Test custom start from a message ID and a message link in a non-forum chat.
-6. Create a source forum with at least two named topics; use `CREATE_FORUM`; verify destination forum/topics and topic-routing.
-7. Test a text reply whose parent is also selected in Everything mode.
-8. Enable sync, exhaust source content, wait 300 seconds, and confirm final scan then completion.
-9. Trigger/rate-limit test only with normal Telegram behavior; confirm FloodWait state and safe resume.
+6. Create a source forum with at least two named topics; select one topic, use `CREATE_FORUM`, and verify only that topic is cloned/routed.
+7. Repeat with `✅ Select all` and verify all selected topics are created and routed.
+8. Test a text reply whose parent is also selected in Everything mode.
+9. Enable sync, exhaust source content, wait 300 seconds, and confirm final scan then completion.
+10. Trigger/rate-limit test only with normal Telegram behavior; confirm FloodWait state and safe resume.

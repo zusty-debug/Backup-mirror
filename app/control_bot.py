@@ -161,9 +161,13 @@ class TelegramControlBot:
             await event.answer()
             await self._reply(event, self._help_text(), parse_mode="html")
             return
+        if data.startswith("topic:") or data.startswith("topics:"):
+            await event.answer()
+            await self._choose_forum_topics(event, user_id, data)
+            return
         if data.startswith("content:"):
             await event.answer()
-            await self._choose_content(event, user_id, data.split(":", 1)[1])
+            await self._choose_content(event, user_id, data)
             return
         if data.startswith("mode:"):
             await event.answer()
@@ -322,6 +326,21 @@ class TelegramControlBot:
             await self._send_menu(event, "Worker account connected.")
         elif flow.stage == "source":
             flow.data["source_ref"] = text
+            try:
+                topics = await self.gateway.forum_topics(self.gateway.default_profile_id(user_id), text)
+            except TelegramGatewayError as exc:
+                await self._reply(event, f"Unable to inspect source: <code>{self._esc(str(exc))}</code>")
+                return
+            if topics:
+                flow.data["forum_topics"] = topics
+                flow.data["selected_topic_ids"] = []
+                flow.stage = "forum_topics"
+                await self._reply(
+                    event,
+                    "<b>🧵 Select forum topics</b>\n\nTap one or more topics, then press <b>Done</b>.",
+                    buttons=self._forum_topic_buttons(flow),
+                )
+                return
             flow.stage = "destination"
             await self._reply(
                 event,
@@ -338,15 +357,12 @@ class TelegramControlBot:
                 await self._reply(event, "Project name cannot be empty.")
                 return
             flow.data["name"] = name[:100]
+            flow.data["selected_content"] = []
             flow.stage = "content"
             await self._reply(
                 event,
-                "<b>📦 Choose content to copy</b>\n\nEach item is sent as a fresh destination message — never forwarded.",
-                buttons=[
-                    [Button.inline("📄 Files only", b"content:files"), Button.inline("🎞️ Media only", b"content:media")],
-                    [Button.inline("🔗 Links only", b"content:links"), Button.inline("📦 Media + Files + Links", b"content:media_files_links")],
-                    [Button.inline("✨ Everything (text, replies, GIFs, stickers)", b"content:everything")],
-                ],
+                "<b>📦 Select content to copy</b>\n\nTap one or more of Files, Media, and Links. Everything is an all-content mode.",
+                buttons=self._content_buttons(flow),
             )
         elif flow.stage == "message_id":
             try:
@@ -364,25 +380,108 @@ class TelegramControlBot:
                 return
             flow.data["start_message_id"] = message_id
             await self._create_project(event, user_id, flow)
-    async def _choose_content(self, event: events.CallbackQuery.Event, user_id: int, choice: str) -> None:
+    def _forum_topic_buttons(self, flow: Flow):
+        selected = {int(topic_id) for topic_id in flow.data.get("selected_topic_ids", [])}
+        rows = []
+        for topic in flow.data.get("forum_topics", [])[:20]:
+            topic_id = int(topic["id"])
+            mark = "✅" if topic_id in selected else "⬜"
+            title = truncate(str(topic["title"]), 28)
+            rows.append([Button.inline(f"{mark} {title}", f"topic:toggle:{topic_id}".encode())])
+        rows.append([Button.inline("✅ Select all", b"topics:all"), Button.inline("➡️ Done", b"topics:done")])
+        return rows
+
+    async def _choose_forum_topics(self, event: events.CallbackQuery.Event, user_id: int, data: str) -> None:
+        flow = self.flows.get(user_id)
+        if not flow or flow.stage != "forum_topics":
+            await event.answer("Start a new project again", alert=True)
+            return
+        topics = flow.data.get("forum_topics", [])
+        selected = {int(topic_id) for topic_id in flow.data.get("selected_topic_ids", [])}
+        if data.startswith("topic:toggle:"):
+            topic_id = int(data.rsplit(":", 1)[1])
+            if topic_id in selected:
+                selected.remove(topic_id)
+            else:
+                selected.add(topic_id)
+            flow.data["selected_topic_ids"] = sorted(selected)
+            await self._edit_reply(
+                event,
+                "<b>🧵 Select forum topics</b>\n\nTap one or more topics, then press <b>Done</b>.",
+                buttons=self._forum_topic_buttons(flow),
+            )
+            return
+        if data == "topics:all":
+            flow.data["selected_topic_ids"] = [int(topic["id"]) for topic in topics]
+            await self._edit_reply(
+                event,
+                "<b>🧵 Select forum topics</b>\n\nAll displayed topics selected. Press <b>Done</b>.",
+                buttons=self._forum_topic_buttons(flow),
+            )
+            return
+        if data == "topics:done":
+            if not selected:
+                await event.answer("Select at least one topic", alert=True)
+                return
+            flow.stage = "destination"
+            await self._edit_reply(
+                event,
+                "🧵 Topics selected.\n\nSend <code>CREATE_FORUM</code> to create a new matching forum clone.",
+            )
+
+    def _content_buttons(self, flow: Flow):
+        selected = set(flow.data.get("selected_content", []))
+        def label(key: str, emoji: str, title: str) -> str:
+            return f"{'✅' if key in selected else '⬜'} {emoji} {title}"
+        return [
+            [Button.inline(label("files", "📄", "Files"), b"content:toggle:files"), Button.inline(label("media", "🎞️", "Media"), b"content:toggle:media")],
+            [Button.inline(label("links", "🔗", "Links"), b"content:toggle:links")],
+            [Button.inline(label("everything", "✨", "Everything"), b"content:toggle:everything")],
+            [Button.inline("➡️ Done", b"content:done")],
+        ]
+
+    async def _choose_content(self, event: events.CallbackQuery.Event, user_id: int, data: str) -> None:
         flow = self.flows.get(user_id)
         if not flow or flow.stage != "content":
             await event.answer("Start a new project again", alert=True)
             return
-        content_modes = {
-            "files": "FILES",
-            "media": "MEDIA",
-            "links": "LINKS",
-            "media_files_links": "MEDIA_FILES_LINKS",
-            "everything": "EVERYTHING",
-        }
-        mode = content_modes.get(choice)
-        if not mode:
-            await event.answer("Invalid content mode", alert=True)
+        selected = set(flow.data.get("selected_content", []))
+        if data.startswith("content:toggle:"):
+            choice = data.rsplit(":", 1)[1]
+            if choice == "everything":
+                selected = set() if "everything" in selected else {"everything"}
+            elif choice in {"files", "media", "links"}:
+                selected.discard("everything")
+                if choice in selected:
+                    selected.remove(choice)
+                else:
+                    selected.add(choice)
+            flow.data["selected_content"] = sorted(selected)
+            await self._edit_reply(
+                event,
+                "<b>📦 Select content to copy</b>\n\nTap one or more of Files, Media, and Links. Everything is an all-content mode.",
+                buttons=self._content_buttons(flow),
+            )
             return
+        if data != "content:done" or not selected:
+            await event.answer("Select at least one content type", alert=True)
+            return
+        if "everything" in selected:
+            mode = "EVERYTHING"
+        elif selected == {"files"}:
+            mode = "FILES"
+        elif selected == {"media"}:
+            mode = "MEDIA"
+        elif selected == {"links"}:
+            mode = "LINKS"
+        elif selected == {"files", "media"}:
+            mode = "MEDIA_FILES"
+        else:
+            mode = "MEDIA_FILES_LINKS"
         flow.data["settings"] = ProjectSettings(
             content_mode=mode,
             preserve_captions=mode == "EVERYTHING",
+            forum_topic_ids=[int(topic_id) for topic_id in flow.data.get("selected_topic_ids", [])],
         )
         flow.stage = "mode"
         await self._edit_reply(
@@ -677,6 +776,7 @@ class TelegramControlBot:
             f"🧵 Forum topics: {'Clone enabled' if project.settings.clone_forum_topics else 'Normal chat'}\n"
             f"📝 Captions: {'On' if project.settings.preserve_captions else 'Off'} · "
             f"🔄 Sync: {'On' if project.settings.continuous_sync else 'Off'}"
+            + (f"\n\n❌ Last error: <code>{TelegramControlBot._esc(truncate(project.last_error, 260))}</code>" if project.last_error else "")
         )
 
     @staticmethod

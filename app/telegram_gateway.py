@@ -236,6 +236,37 @@ class TelegramGateway:
                 return 0
             return int(latest[0].id)
 
+    async def forum_topics(self, profile_id: int, source_ref: str) -> list[dict[str, int | str | None]]:
+        """List accessible forum topics for project setup selection."""
+        async with self.client_for_profile(profile_id) as client:
+            source = await self.resolve_entity(client, source_ref)
+            if not getattr(source, "forum", False):
+                return []
+            result = await client(
+                functions.messages.GetForumTopicsRequest(
+                    peer=source,
+                    offset_date=None,
+                    offset_id=0,
+                    offset_topic=0,
+                    limit=100,
+                    q=None,
+                )
+            )
+            topics: list[dict[str, int | str | None]] = []
+            for topic in getattr(result, "topics", []):
+                topic_id = getattr(topic, "id", None)
+                if topic_id is None:
+                    continue
+                topics.append(
+                    {
+                        "id": int(topic_id),
+                        "title": str(getattr(topic, "title", None) or f"Topic {topic_id}"),
+                        "icon_color": getattr(topic, "icon_color", None),
+                        "icon_emoji_id": getattr(topic, "icon_emoji_id", None),
+                    }
+                )
+            return topics
+
     async def _assert_can_send_media(self, client: TelegramClient, destination: object) -> None:
         try:
             permissions = await client.get_permissions(destination, "me")
