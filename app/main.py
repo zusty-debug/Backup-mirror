@@ -5,13 +5,8 @@ import logging
 import shutil
 from contextlib import suppress
 
-from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.fsm.storage.memory import MemoryStorage
-
-from .bot_ui import BotController
 from .config import Settings
+from .control_bot import TelegramControlBot
 from .crypto import SecretBox
 from .database import Database
 from .logging_setup import configure_logging
@@ -22,7 +17,6 @@ logger = logging.getLogger(__name__)
 
 
 def cleanup_temp_directory(settings: Settings) -> int:
-    """Remove temporary project directories left by an unclean process termination."""
     removed = 0
     if not settings.temp_dir.exists():
         return 0
@@ -48,24 +42,18 @@ async def run() -> None:
     removed = cleanup_temp_directory(settings)
     logger.info("Startup recovery prepared %s incomplete transfers and removed %s temporary paths", retryable, removed)
 
-    secret_box = SecretBox(settings.encryption_key)
-    gateway = TelegramGateway(settings, database, secret_box)
-    bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    workers = WorkerManager(BackupWorker(settings, database, gateway, bot), database)
-    controller = BotController(settings=settings, database=database, gateway=gateway, workers=workers, bot=bot)
-    dispatcher = Dispatcher(storage=MemoryStorage())
-    dispatcher.include_router(controller.router)
-
+    gateway = TelegramGateway(settings, database, SecretBox(settings.encryption_key))
+    worker = BackupWorker(settings, database, gateway, bot=None)
+    workers = WorkerManager(worker, database)
+    control = TelegramControlBot(settings, database, gateway, workers)
+    worker.bot = control
     try:
-        await bot.delete_webhook(drop_pending_updates=False)
-        await workers.resume_after_restart()
-        logger.info("Telegram Media Mirror Bot started")
-        await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
+        await control.start()
     finally:
         logger.info("Stopping Telegram Media Mirror Bot")
         await workers.shutdown()
         with suppress(Exception):
-            await bot.session.close()
+            await control.close()
         database.close()
 
 

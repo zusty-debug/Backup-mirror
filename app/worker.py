@@ -8,8 +8,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
-from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from telethon import errors
 from telethon.tl.custom.message import Message
 
@@ -46,7 +44,7 @@ class DownloadedMedia:
 class BackupWorker:
     """One ordered worker for one project. It never invokes Telegram forwarding APIs."""
 
-    def __init__(self, settings: Settings, database: Database, gateway: TelegramGateway, bot: Bot) -> None:
+    def __init__(self, settings: Settings, database: Database, gateway: TelegramGateway, bot) -> None:
         self.settings = settings
         self.database = database
         self.gateway = gateway
@@ -489,11 +487,9 @@ class BackupWorker:
             await self.bot.edit_message_text(
                 text, chat_id=project.status_message_chat_id, message_id=project.status_message_id
             )
-        except TelegramBadRequest as exc:
+        except Exception as exc:
             if "message is not modified" not in str(exc).lower():
                 logger.debug("Unable to edit status message for %s: %s", project.id, exc)
-        except TelegramForbiddenError:
-            logger.warning("Cannot update status message for project %s", project.id)
 
     @staticmethod
     def _delete_downloads(items: Iterable[DownloadedMedia]) -> None:

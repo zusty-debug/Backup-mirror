@@ -4,7 +4,7 @@ A private Telegram control bot that backs up **media and files only** from one p
 
 ## Included baseline
 
-- Python, Telethon, aiogram, SQLite WAL mode
+- Python, Telethon, SQLite WAL mode
 - One encrypted `StringSession` worker-account profile per authorised operator
 - `/start`, `/connect`, `/new`, `/projects`, `/help`
 - Setup wizard: source, destination, project name, full/from-message/date-range/new-files scan mode
@@ -157,11 +157,10 @@ git push -u origin main
 
 ```text
 app/
-  bot_ui.py             aiogram commands, menus, FSM project/session setup
+  control_bot.py        Telethon commands, menus, project/session setup
   config.py             environment configuration
   crypto.py             encrypted session helper
   database.py           SQLite schema and transactional repository
-  keyboards.py          inline bot menus
   main.py               polling process lifecycle and recovery
   models.py             project and transfer domain types
   reports.py            full-report generator
