@@ -28,6 +28,8 @@ class ScanProgress:
     failed_this_run: int = 0
     bytes_this_run: int = 0
     current_file: str = "Preparing…"
+    phase: str = "🚀 Preparing"
+    total_eligible: int | None = None
     started_at: float = field(default_factory=time.monotonic)
 
 
@@ -65,9 +67,13 @@ class BackupWorker:
             self.database.update_project_status(project.id, ProjectStatus.RUNNING)
             await self._status(project, progress, force=True)
 
+            waited_for_idle_media = False
             while True:
                 project = self._reload(project.id)
+                eligible_before_pass = progress.eligible
+                progress.phase = "🔎 Scanning source"
                 await self._run_single_pass(project, progress)
+                found_media_this_pass = progress.eligible > eligible_before_pass
                 project = self._reload(project.id)
                 state = await self._handle_requested_state(project, progress)
                 if state is not None:
@@ -75,14 +81,27 @@ class BackupWorker:
                     break
                 if not project.settings.continuous_sync:
                     self.database.update_project_status(project.id, ProjectStatus.COMPLETED)
+                    progress.phase = "✅ Backup completed"
                     result = "COMPLETED"
                     break
-                progress.current_file = f"Waiting {self.settings.sync_poll_seconds}s for new media"
+                if waited_for_idle_media and not found_media_this_pass:
+                    self.database.update_project_status(project.id, ProjectStatus.COMPLETED)
+                    progress.phase = "⏹️ Sync stopped — no new media"
+                    progress.current_file = "No new media arrived during the idle timer"
+                    result = "IDLE_TIMEOUT"
+                    break
+                if found_media_this_pass:
+                    waited_for_idle_media = False
+                    continue
+                idle_seconds = max(30, int(project.settings.idle_stop_seconds or self.settings.sync_poll_seconds))
+                progress.phase = "👀 Waiting for new media"
+                progress.current_file = f"Waiting up to {idle_seconds}s for a new media/file"
                 await self._status(project, progress, force=True)
-                if await self._wait_for_sync_or_control(project.id):
+                if await self._wait_for_sync_or_control(project.id, idle_seconds):
                     project = self._reload(project.id)
                     result = await self._handle_requested_state(project, progress) or "STOPPED"
                     break
+                waited_for_idle_media = True
         except asyncio.CancelledError:
             self.database.update_project_status(project_id, ProjectStatus.PAUSED, "Worker task was interrupted")
             result = "INTERRUPTED"
@@ -228,9 +247,10 @@ class BackupWorker:
         """
         attempt = 0
         source_chat_id = int(project.source_chat_id)
+        progress.phase = "⚡ Sending fresh album via Telegram"
         while attempt < self.settings.max_upload_retries:
             try:
-                for message, media_type in group:
+                for message, media_type in group: 
                     filename = self._message_filename(message, media_type)
                     size = int(getattr(getattr(message, "file", None), "size", 0) or 0)
                     progress.current_file = filename
@@ -394,6 +414,7 @@ class BackupWorker:
         filename = self._message_filename(message, media_type)
         size = int(getattr(getattr(message, "file", None), "size", 0) or 0)
         progress.current_file = filename
+        progress.phase = "⚡ Sending fresh media via Telegram"
         while attempt < self.settings.max_upload_retries:
             try:
                 self.database.begin_transfer(
@@ -619,8 +640,8 @@ class BackupWorker:
             return "STOPPED"
         return None
 
-    async def _wait_for_sync_or_control(self, project_id: str) -> bool:
-        remaining = self.settings.sync_poll_seconds
+    async def _wait_for_sync_or_control(self, project_id: str, seconds: int) -> bool:
+        remaining = seconds
         while remaining > 0:
             await asyncio.sleep(min(remaining, 5))
             remaining -= 5
@@ -640,19 +661,29 @@ class BackupWorker:
         elapsed = max(time.monotonic() - progress.started_at, 0.001)
         speed = progress.bytes_this_run / elapsed
         state = self._reload(project.id).status.value
-        title = "Backup completed" if final and state == ProjectStatus.COMPLETED.value else "Backup status"
+        title = "✅ Backup completed" if final and state == ProjectStatus.COMPLETED.value else "📡 Live backup status"
+        elapsed_text = self._readable_duration(elapsed)
+        copied_or_skipped = counters.completed + progress.skipped
+        progress_line = f"{copied_or_skipped:,} processed"
+        if progress.total_eligible:
+            percentage = min(100.0, copied_or_skipped * 100 / progress.total_eligible)
+            progress_line = f"{copied_or_skipped:,} / {progress.total_eligible:,} ({percentage:.1f}%)"
         text = (
             f"<b>{title}</b>\n"
-            f"Project: <b>{self._escape(project.name)}</b>\n"
-            f"State: <code>{state}</code>\n\n"
-            f"Scanned this pass: {progress.scanned:,}\n"
-            f"Media/files found: {progress.eligible:,}\n"
-            f"Successfully copied: {counters.completed:,}\n"
-            f"Skipped: {progress.skipped:,}\n"
-            f"Failed: {max(counters.failed, progress.failed_this_run):,}\n"
-            f"Transferred: {readable_bytes(counters.bytes_transferred)}\n"
-            f"Speed this pass: {readable_bytes(speed)}/s\n"
-            f"Current: <code>{self._escape(truncate(progress.current_file, 70))}</code>"
+            f"📁 Project: <b>{self._escape(project.name)}</b>\n"
+            f"🔄 State: <code>{state}</code>\n"
+            f"📍 Phase: {self._escape(progress.phase)}\n\n"
+            f"📊 Progress: {progress_line}\n"
+            f"🔎 Source messages scanned: {progress.scanned:,}\n"
+            f"🎞️ Media/files found: {progress.eligible:,}\n"
+            f"✅ Copied: {counters.completed:,}\n"
+            f"⏭️ Skipped: {progress.skipped:,}\n"
+            f"⚠️ Failed: {max(counters.failed, progress.failed_this_run):,}\n"
+            f"📦 Media reused: {readable_bytes(counters.bytes_transferred)}\n"
+            f"⚡ Effective speed: {readable_bytes(speed)}/s\n"
+            f"⏱️ Elapsed: {elapsed_text}\n"
+            f"📌 Current: <code>{self._escape(truncate(progress.current_file, 70))}</code>\n\n"
+            "<i>Developed by — @xzusty</i>"
         )
         try:
             await self.bot.edit_message_text(
@@ -680,6 +711,17 @@ class BackupWorker:
     @staticmethod
     def _error_text(exc: BaseException) -> str:
         return truncate(f"{exc.__class__.__name__}: {exc}", 500)
+
+    @staticmethod
+    def _readable_duration(seconds: float) -> str:
+        total = max(0, int(seconds))
+        hours, remainder = divmod(total, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}h {minutes}m {seconds}s"
+        if minutes:
+            return f"{minutes}m {seconds}s"
+        return f"{seconds}s"
 
     @staticmethod
     def _escape(value: str) -> str:

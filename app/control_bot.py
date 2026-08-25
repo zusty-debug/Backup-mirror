@@ -62,7 +62,20 @@ class TelegramControlBot:
             await self.client.disconnect()
 
     async def edit_message_text(self, text: str, *, chat_id: int, message_id: int) -> None:
-        await self.client.edit_message(chat_id, message_id, text, parse_mode="html", buttons=None)
+        await self.client.edit_message(chat_id, message_id, self._brand(text), parse_mode="html", buttons=None)
+
+    @staticmethod
+    def _brand(text: str) -> str:
+        footer = "<i>Developed by — @xzusty</i>"
+        return text if footer in text else f"{text}\n\n{footer}"
+
+    async def _reply(self, event, text: str, *args, **kwargs):
+        kwargs.setdefault("parse_mode", "html")
+        return await event.respond(self._brand(text), *args, **kwargs)
+
+    async def _edit_reply(self, event, text: str, *args, **kwargs):
+        kwargs.setdefault("parse_mode", "html")
+        return await event.edit(self._brand(text), *args, **kwargs)
 
     def _allowed(self, user_id: int | None) -> bool:
         return bool(user_id and user_id in self.settings.owner_ids)
@@ -77,10 +90,10 @@ class TelegramControlBot:
         self.database.ensure_user(user_id)
         if text.startswith("/start"):
             self.flows.pop(user_id, None)
-            await self._send_menu(event, "<b>Telegram Media Backup Bot</b>\n\nChoose an action.")
+            await self._send_menu(event, "<b>✨ Telegram Media Backup Bot</b>\n\nChoose an action below.")
             return
         if text.startswith("/help"):
-            await event.respond(self._help_text(), parse_mode="html")
+            await self._reply(event, self._help_text(), parse_mode="html")
             return
         if text.startswith("/connect"):
             await self._begin_connect(event)
@@ -121,9 +134,17 @@ class TelegramControlBot:
             await event.answer()
             await self._edit_projects(event, user_id)
             return
+        if data == "worker:status":
+            await event.answer()
+            await self._edit_worker_status(event, user_id)
+            return
+        if data in {"admin", "admin:refresh"}:
+            await event.answer()
+            await self._edit_admin_panel(event, user_id)
+            return
         if data == "help":
             await event.answer()
-            await event.respond(self._help_text(), parse_mode="html")
+            await self._reply(event, self._help_text(), parse_mode="html")
             return
         if data.startswith("mode:"):
             await event.answer()
@@ -156,7 +177,7 @@ class TelegramControlBot:
                 return
             status = await self.client.send_message(
                 event.chat_id,
-                f"<b>Backup status</b>\nProject: <b>{self._esc(project.name)}</b>\nPreparing…",
+                self._brand(f"<b>📡 Live backup status</b>\n📁 Project: <b>{self._esc(project.name)}</b>\n🚀 Preparing…"),
                 parse_mode="html",
             )
             self.database.set_status_message(project.id, int(event.chat_id), int(status.id))
@@ -174,7 +195,7 @@ class TelegramControlBot:
             await self._edit_project(event, self.database.get_project(project.id, user_id))
         elif action == "stopask":
             await event.answer()
-            await event.edit(
+            await self._edit_reply(event, 
                 f"<b>Stop {self._esc(project.name)}?</b>\n\nProgress is retained for resume.",
                 parse_mode="html",
                 buttons=[[Button.inline("Yes, Stop", f"stop:{project.id}".encode())], [Button.inline("Cancel", f"view:{project.id}".encode())]],
@@ -205,7 +226,11 @@ class TelegramControlBot:
             await self._edit_settings(event, self.database.get_project(project.id, user_id))
         elif action == "report":
             report = build_project_report(self.database, project, self.settings.report_dir)
-            await self.client.send_file(event.chat_id, str(report), caption=f"Full report — {project.name}")
+            await self.client.send_file(
+                event.chat_id,
+                str(report),
+                caption=f"📄 Full report — {project.name}\nDeveloped by — @xzusty",
+            )
             await event.answer("Report sent")
         elif action == "failed":
             rows = self.database.failed_items(project.id, 30)
@@ -216,11 +241,11 @@ class TelegramControlBot:
                     f"• #{row['source_message_id']} — <code>{self._esc(truncate(row['file_name'] or 'Unknown', 45))}</code>"
                     for row in rows
                 )
-            await event.respond(text, parse_mode="html")
+            await self._reply(event, text, parse_mode="html")
             await event.answer()
         elif action == "deleteask":
             await event.answer()
-            await event.edit(
+            await self._edit_reply(event, 
                 f"<b>Delete {self._esc(project.name)}?</b>",
                 parse_mode="html",
                 buttons=[[Button.inline("Yes, Delete", f"delete:{project.id}".encode())], [Button.inline("Cancel", f"view:{project.id}".encode())]],
@@ -235,63 +260,63 @@ class TelegramControlBot:
 
     async def _begin_connect(self, event) -> None:
         self.flows[event.sender_id] = Flow("phone")
-        await event.respond("Send the worker account phone number, for example <code>+15551234567</code>.", parse_mode="html")
+        await self._reply(event, "Send the worker account phone number, for example <code>+15551234567</code>.", parse_mode="html")
 
     async def _begin_new(self, event) -> None:
         if not self.gateway.has_session(event.sender_id):
-            await event.respond("Connect the worker account first using <code>/connect</code>.", parse_mode="html")
+            await self._reply(event, "Connect the worker account first using <code>/connect</code>.", parse_mode="html")
             return
         if self.database.count_projects(event.sender_id) >= self.settings.max_projects_per_owner:
-            await event.respond("Project limit reached.")
+            await self._reply(event, "Project limit reached.")
             return
         self.flows[event.sender_id] = Flow("source")
-        await event.respond("Send the source channel/group username, numeric ID, or Telegram link.")
+        await self._reply(event, "Send the source channel/group username, numeric ID, or Telegram link.")
 
     async def _advance_flow(self, event: events.NewMessage.Event, user_id: int, text: str, flow: Flow) -> None:
         if flow.stage == "phone":
             try:
                 hint = await self.gateway.begin_login(user_id, text)
             except TelegramGatewayError as exc:
-                await event.respond(f"Could not request code: <code>{self._esc(str(exc))}</code>", parse_mode="html")
+                await self._reply(event, f"Could not request code: <code>{self._esc(str(exc))}</code>", parse_mode="html")
                 return
             self.flows[user_id] = Flow("code")
-            await event.respond(f"Code sent to account ending <code>{hint}</code>. Send the code.", parse_mode="html")
+            await self._reply(event, f"Code sent to account ending <code>{hint}</code>. Send the code.", parse_mode="html")
         elif flow.stage == "code":
             try:
                 complete = await self.gateway.finish_login_code(user_id, text)
             except TelegramGatewayError as exc:
-                await event.respond(f"Login error: <code>{self._esc(str(exc))}</code>", parse_mode="html")
+                await self._reply(event, f"Login error: <code>{self._esc(str(exc))}</code>", parse_mode="html")
                 return
             if complete:
                 self.flows.pop(user_id, None)
                 await self._send_menu(event, "Worker account connected.")
             else:
                 self.flows[user_id] = Flow("password")
-                await event.respond("Send the two-step-verification password.")
+                await self._reply(event, "Send the two-step-verification password.")
         elif flow.stage == "password":
             try:
                 await self.gateway.finish_login_password(user_id, text)
             except TelegramGatewayError as exc:
-                await event.respond(f"Login error: <code>{self._esc(str(exc))}</code>", parse_mode="html")
+                await self._reply(event, f"Login error: <code>{self._esc(str(exc))}</code>", parse_mode="html")
                 return
             self.flows.pop(user_id, None)
             await self._send_menu(event, "Worker account connected.")
         elif flow.stage == "source":
             flow.data["source_ref"] = text
             flow.stage = "destination"
-            await event.respond("Send the destination channel/group username, numeric ID, or Telegram link.")
+            await self._reply(event, "Send the destination channel/group username, numeric ID, or Telegram link.")
         elif flow.stage == "destination":
             flow.data["destination_ref"] = text
             flow.stage = "name"
-            await event.respond("Give this backup project a name.")
+            await self._reply(event, "Give this backup project a name.")
         elif flow.stage == "name":
             name = " ".join(text.split())
             if not name:
-                await event.respond("Project name cannot be empty.")
+                await self._reply(event, "Project name cannot be empty.")
                 return
             flow.data["name"] = name[:100]
             flow.stage = "mode"
-            await event.respond(
+            await self._reply(event, 
                 "Choose scan mode.",
                 buttons=[
                     [Button.inline("Full Backup", b"mode:full")],
@@ -304,7 +329,7 @@ class TelegramControlBot:
                 if int(text) <= 0:
                     raise ValueError
             except ValueError:
-                await event.respond("Send a positive message ID.")
+                await self._reply(event, "Send a positive message ID.")
                 return
             await self._create_project(event, user_id, flow)
 
@@ -343,82 +368,176 @@ class TelegramControlBot:
                     self.database.update_project_checkpoint(project.id, latest)
         except (TelegramGatewayError, ProfileNotConnectedError) as exc:
             self.database.delete_project(project.id, user_id)
-            await event.respond(f"Project validation failed: <code>{self._esc(str(exc))}</code>", parse_mode="html")
+            await self._reply(event, f"Project validation failed: <code>{self._esc(str(exc))}</code>", parse_mode="html")
             return
         self.flows[user_id] = Flow("confirm", {"project_id": project.id})
         project = self.database.get_project(project.id, user_id)
-        await event.respond(self._project_card(project), parse_mode="html", buttons=self._confirm_buttons(project.id))
+        await self._reply(event, self._project_card(project), parse_mode="html", buttons=self._confirm_buttons(project.id))
 
     async def _send_menu(self, event, text: str) -> None:
         connected = self.gateway.has_session(event.sender_id)
         buttons = []
         if not connected:
-            buttons.append([Button.inline("Connect Worker Account", b"account:connect")])
-        buttons.extend([[Button.inline("New Backup Project", b"project:new")], [Button.inline("My Projects", b"project:list")], [Button.inline("Help", b"help")]])
-        await event.respond(text, parse_mode="html", buttons=buttons)
+            buttons.append([Button.inline("🔐 Connect Worker Account", b"account:connect")])
+        buttons.extend(
+            [
+                [Button.inline("🚀 New Backup Project", b"project:new")],
+                [Button.inline("📂 My Projects", b"project:list"), Button.inline("👤 Worker Status", b"worker:status")],
+                [Button.inline("🛠️ Admin Panel", b"admin"), Button.inline("ℹ️ Help", b"help")],
+            ]
+        )
+        await self._reply(event, text, parse_mode="html", buttons=buttons)
 
     async def _send_projects(self, event, user_id: int) -> None:
         projects = self.database.list_projects(user_id)
-        await event.respond("<b>My Projects</b>" if projects else "No projects yet.", parse_mode="html", buttons=self._projects_buttons(projects))
+        await self._reply(event, "<b>My Projects</b>" if projects else "No projects yet.", parse_mode="html", buttons=self._projects_buttons(projects))
 
     async def _edit_projects(self, event, user_id: int) -> None:
         projects = self.database.list_projects(user_id)
-        await event.edit("<b>My Projects</b>" if projects else "No projects yet.", parse_mode="html", buttons=self._projects_buttons(projects))
+        await self._edit_reply(event, "<b>My Projects</b>" if projects else "No projects yet.", parse_mode="html", buttons=self._projects_buttons(projects))
+
+    async def _edit_worker_status(self, event, user_id: int) -> None:
+        profile = self.database.worker_profile_summary(user_id)
+        if not profile or not profile["connected"]:
+            await self._edit_reply(
+                event,
+                "<b>👤 Worker Account Status</b>\n\n🔴 No worker account is connected yet.",
+                buttons=[[Button.inline("🔐 Connect Worker Account", b"account:connect")], [Button.inline("🏠 Main Menu", b"project:list")]],
+            )
+            return
+        account_line = "🟡 Session saved — checking account"
+        try:
+            async with self.gateway.client_for_profile(int(profile["id"])) as client:
+                me = await client.get_me()
+                name = " ".join(part for part in [me.first_name, me.last_name] if part).strip() or "Telegram user"
+                username = f"@{me.username}" if me.username else "No username"
+                account_line = f"🟢 Connected\n👤 Account: <b>{self._esc(name)}</b> ({self._esc(username)})\n🆔 Account ID: <code>{me.id}</code>"
+        except Exception as exc:
+            account_line = f"🟠 Saved session could not be checked: <code>{self._esc(truncate(str(exc), 110))}</code>"
+        summary = self.database.project_status_summary(user_id)
+        restrictions = self.database.observed_worker_restrictions(user_id)
+        waiting = summary.get(ProjectStatus.WAITING_RATE_LIMIT.value, 0)
+        restriction_text = "🟢 No observed Telegram spam/restriction error."
+        if restrictions:
+            restriction_text = f"⚠️ Observed restriction/rate error: <code>{self._esc(truncate(restrictions[0], 120))}</code>"
+        text = (
+            "<b>👤 Worker Account Status</b>\n\n"
+            f"{account_line}\n\n"
+            f"📱 Phone hint: <code>{self._esc(str(profile['phone_hint'] or 'Unknown'))}</code>\n"
+            f"🗓️ Session added: <code>{self._esc(str(profile['created_at']))}</code>\n"
+            f"🔄 Last session update: <code>{self._esc(str(profile['updated_at']))}</code>\n"
+            f"⏳ Projects currently in FloodWait: {waiting}\n"
+            f"{restriction_text}\n\n"
+            "ℹ️ Telegram does not provide a reliable advance spam-block status API; this panel reports live session health and observed delivery/rate-limit errors."
+        )
+        await self._edit_reply(
+            event,
+            text,
+            buttons=[[Button.inline("🔄 Refresh", b"worker:status")], [Button.inline("🛠️ Admin Panel", b"admin"), Button.inline("📂 Projects", b"project:list")]],
+        )
+
+    async def _edit_admin_panel(self, event, user_id: int) -> None:
+        summary = self.database.project_status_summary(user_id)
+        profile = self.database.worker_profile_summary(user_id)
+        total = sum(summary.values())
+        running = summary.get(ProjectStatus.RUNNING.value, 0) + summary.get(ProjectStatus.WAITING_RATE_LIMIT.value, 0)
+        paused = summary.get(ProjectStatus.PAUSED.value, 0)
+        completed = summary.get(ProjectStatus.COMPLETED.value, 0)
+        failed = summary.get(ProjectStatus.FAILED.value, 0)
+        worker_state = "🟢 Session connected" if profile and profile["connected"] else "🔴 No worker session"
+        text = (
+            "<b>🛠️ Admin Control Center</b>\n\n"
+            f"📁 Total projects: {total}\n"
+            f"🟢 Running / rate-limited: {running}\n"
+            f"⏸️ Paused: {paused}\n"
+            f"✅ Completed: {completed}\n"
+            f"⚠️ Failed: {failed}\n"
+            f"👷 Active worker tasks: {sum(1 for task in self.workers.tasks.values() if not task.done())}\n"
+            f"👤 Worker account: {worker_state}\n\n"
+            "Use the buttons below to inspect projects and worker health."
+        )
+        await self._edit_reply(
+            event,
+            text,
+            buttons=[
+                [Button.inline("🔄 Refresh Dashboard", b"admin:refresh")],
+                [Button.inline("📂 My Projects", b"project:list"), Button.inline("👤 Worker Status", b"worker:status")],
+                [Button.inline("➕ New Project", b"project:new")],
+            ],
+        )
 
     @staticmethod
     def _projects_buttons(projects: list[Project]):
-        rows = [[Button.inline(f"{project.name[:28]} · {project.status.value}", f"view:{project.id}".encode())] for project in projects]
-        rows.append([Button.inline("New Backup Project", b"project:new")])
+        rows = [[Button.inline(f"📁 {project.name[:25]} · {project.status.value}", f"view:{project.id}".encode())] for project in projects]
+        rows.append([Button.inline("🚀 New Backup Project", b"project:new")])
         return rows
 
     @staticmethod
     def _confirm_buttons(project_id: str):
-        return [[Button.inline("Confirm Project", f"confirm:{project_id}".encode())], [Button.inline("Cancel", f"cancel:{project_id}".encode())]]
+        return [[Button.inline("✅ Confirm Project", f"confirm:{project_id}".encode())], [Button.inline("❌ Cancel", f"cancel:{project_id}".encode())]]
 
     async def _edit_project(self, event, project: Project, show_counters: bool = False) -> None:
         text = self._project_card(project)
         if show_counters:
             counters = self.database.counters(project.id)
             text += f"\n\nCompleted: {counters.completed:,}\nFailed: {counters.failed:,}\nTransferred: {readable_bytes(counters.bytes_transferred)}"
-        await event.edit(text, parse_mode="html", buttons=self._project_buttons(project.id))
+        await self._edit_reply(event, text, parse_mode="html", buttons=self._project_buttons(project.id))
 
     @staticmethod
     def _project_buttons(project_id: str):
         return [
-            [Button.inline("Start / Resume", f"start:{project_id}".encode()), Button.inline("Pause", f"pause:{project_id}".encode())],
-            [Button.inline("Stop", f"stopask:{project_id}".encode()), Button.inline("Status", f"status:{project_id}".encode())],
-            [Button.inline("Settings", f"settings:{project_id}".encode()), Button.inline("Full Report", f"report:{project_id}".encode())],
-            [Button.inline("Failed Files", f"failed:{project_id}".encode()), Button.inline("Delete", f"deleteask:{project_id}".encode())],
-            [Button.inline("My Projects", b"project:list")],
+            [Button.inline("▶️ Start / Resume", f"start:{project_id}".encode()), Button.inline("⏸️ Pause", f"pause:{project_id}".encode())],
+            [Button.inline("⏹️ Stop", f"stopask:{project_id}".encode()), Button.inline("📡 Live Status", f"status:{project_id}".encode())],
+            [Button.inline("⚙️ Settings", f"settings:{project_id}".encode()), Button.inline("📄 Full Report", f"report:{project_id}".encode())],
+            [Button.inline("⚠️ Failed Files", f"failed:{project_id}".encode()), Button.inline("🗑️ Delete", f"deleteask:{project_id}".encode())],
+            [Button.inline("📂 My Projects", b"project:list"), Button.inline("🛠️ Admin", b"admin")],
         ]
 
     async def _edit_settings(self, event, project: Project) -> None:
         settings = project.settings
-        text = f"<b>Settings — {self._esc(project.name)}</b>\n\nToggle captions or continuous sync."
-        await event.edit(
+        text = (
+            f"<b>⚙️ Settings — {self._esc(project.name)}</b>\n\n"
+            "⚡ Transfer: Telegram server-side fresh send\n"
+            f"📝 Captions: {'Preserved' if settings.preserve_captions else 'Removed'}\n"
+            f"🔄 Continuous sync: {'Enabled' if settings.continuous_sync else 'Disabled'}\n"
+            f"⏲️ Idle stop timer: {settings.idle_stop_seconds}s\n\n"
+            "When sync finds no media, it waits once for the timer, scans one final time, then stops if still idle."
+        )
+        await self._edit_reply(
+            event,
             text,
             parse_mode="html",
             buttons=[
-                [Button.inline(f"Captions: {'On' if settings.preserve_captions else 'Off'}", f"caption:{project.id}".encode())],
-                [Button.inline(f"Continuous sync: {'On' if settings.continuous_sync else 'Off'}", f"sync:{project.id}".encode())],
-                [Button.inline("Back", f"view:{project.id}".encode())],
+                [Button.inline(f"📝 Captions: {'On' if settings.preserve_captions else 'Off'}", f"caption:{project.id}".encode())],
+                [Button.inline(f"🔄 Sync: {'On' if settings.continuous_sync else 'Off'}", f"sync:{project.id}".encode())],
+                [Button.inline("⬅️ Back", f"view:{project.id}".encode())],
             ],
         )
 
     @staticmethod
     def _project_card(project: Project) -> str:
         return (
-            f"<b>{TelegramControlBot._esc(project.name)}</b>\n"
-            f"Status: <code>{project.status.value}</code>\n"
-            f"Source: {TelegramControlBot._esc(project.source_name or project.source_ref)}\n"
-            f"Destination: {TelegramControlBot._esc(project.destination_name or project.destination_ref)}\n"
-            f"Mode: {project.scan_mode.value}\n"
-            f"Captions: {'On' if project.settings.preserve_captions else 'Off'} · Sync: {'On' if project.settings.continuous_sync else 'Off'}"
+            f"<b>📁 {TelegramControlBot._esc(project.name)}</b>\n"
+            f"🔄 Status: <code>{project.status.value}</code>\n"
+            f"📥 Source: {TelegramControlBot._esc(project.source_name or project.source_ref)}\n"
+            f"📤 Destination: {TelegramControlBot._esc(project.destination_name or project.destination_ref)}\n"
+            f"🧭 Mode: {project.scan_mode.value}\n"
+            "⚡ Transfer: Telegram server-side fresh send\n"
+            f"📝 Captions: {'On' if project.settings.preserve_captions else 'Off'} · "
+            f"🔄 Sync: {'On' if project.settings.continuous_sync else 'Off'}"
         )
 
     @staticmethod
     def _help_text() -> str:
-        return "<b>Commands</b>\n/start — menu\n/connect — connect worker account\n/new — new project\n/projects — project list\n/help — help"
+        return (
+            "<b>ℹ️ Commands</b>\n\n"
+            "/start — 🏠 Main menu\n"
+            "/connect — 🔐 Connect worker account\n"
+            "/new — 🚀 New backup project\n"
+            "/projects — 📂 Project list\n"
+            "/help — ℹ️ Help\n\n"
+            "⚡ Media is sent as a fresh Telegram message without forwarding and without local file download."
+        )
 
     @staticmethod
     def _esc(value: str) -> str:

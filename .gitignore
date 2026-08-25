@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+data/*
+!data/.gitkeep
 data/*.db
 data/*.sqlite
 data/sessions/

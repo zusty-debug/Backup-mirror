@@ -75,6 +75,9 @@ class ProjectSettings:
     # This avoids local download/re-upload and never uses forwarding APIs.
     server_side_copy: bool = True
     continuous_sync: bool = False
+    # When sync is enabled and a scan finds no media, wait this long once,
+    # perform one final scan, then complete if it is still idle.
+    idle_stop_seconds: int = 300
 
     def allows(self, media_type: MediaType) -> bool:
         return media_type.value in {str(value) for value in self.media_types}

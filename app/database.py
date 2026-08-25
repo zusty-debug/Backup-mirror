@@ -525,3 +525,46 @@ class Database:
                 (project_id, TransferStatus.FAILED.value, TransferStatus.RETRY_WAIT.value, limit),
             ).fetchall()
         return [int(row["source_message_id"]) for row in rows]
+
+    def project_status_summary(self, owner_id: int) -> dict[str, int]:
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT status, COUNT(*) AS total FROM projects WHERE owner_id = ? GROUP BY status",
+                (owner_id,),
+            ).fetchall()
+        return {str(row["status"]): int(row["total"]) for row in rows}
+
+    def worker_profile_summary(self, owner_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT id, label, phone_hint, session_encrypted, created_at, updated_at
+                FROM telegram_profiles WHERE owner_id = ? AND label = 'default'
+                """,
+                (owner_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row["id"]),
+            "label": str(row["label"]),
+            "phone_hint": row["phone_hint"],
+            "connected": bool(row["session_encrypted"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def observed_worker_restrictions(self, owner_id: int) -> list[str]:
+        """Return recent project errors that indicate an observed Telegram restriction."""
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                SELECT last_error FROM projects
+                WHERE owner_id = ? AND last_error IS NOT NULL
+                  AND (last_error LIKE '%PeerFlood%' OR last_error LIKE '%UserRestricted%'
+                       OR last_error LIKE '%FloodWait%')
+                ORDER BY updated_at DESC LIMIT 5
+                """,
+                (owner_id,),
+            ).fetchall()
+        return [str(row["last_error"]) for row in rows]

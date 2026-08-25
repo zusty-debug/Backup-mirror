@@ -31,6 +31,7 @@ def build_project_report(database: Database, project: Project, report_dir: Path)
         f"- Preserve albums: {project.settings.preserve_albums}",
         f"- Skip duplicates: {project.settings.skip_duplicates}",
         f"- Continuous sync: {project.settings.continuous_sync}",
+        f"- Idle-stop timer: {project.settings.idle_stop_seconds} seconds",
         f"- Checksum enabled: {project.settings.checksum_enabled}",
         f"- Transfer mode: {'Telegram server-side fresh send' if project.settings.server_side_copy else 'Download and re-upload'}",
         "",
