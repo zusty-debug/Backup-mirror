@@ -1,0 +1,24 @@
+# Runtime secrets and local state
+.env
+.env.*
+!.env.example
+data/*.db
+data/*.sqlite
+data/sessions/
+data/tmp/
+data/reports/
+*.session
+*.session-journal
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

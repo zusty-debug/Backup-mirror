@@ -1,0 +1,38 @@
+services:
+  - type: worker
+    name: telegram-media-mirror-bot
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: OWNER_IDS
+        sync: false
+      - key: DATA_DIR
+        value: /app/data
+      - key: DATABASE_PATH
+        value: /app/data/mirror.db
+      - key: TEMP_DIR
+        value: /app/data/tmp
+      - key: REPORT_DIR
+        value: /app/data/reports
+      - key: STATUS_UPDATE_SECONDS
+        value: "8"
+      - key: SYNC_POLL_SECONDS
+        value: "300"
+      - key: MAX_PROJECTS_PER_OWNER
+        value: "20"
+      - key: MAX_UPLOAD_RETRIES
+        value: "4"
+    disk:
+      name: mirror-data
+      mountPath: /app/data
+      sizeGB: 10
