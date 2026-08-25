@@ -1,2 +1,0 @@
-[console_scripts]
-telegram-media-mirror = app.main:main
