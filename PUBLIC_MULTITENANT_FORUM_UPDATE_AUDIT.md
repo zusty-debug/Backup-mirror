@@ -342,7 +342,42 @@ Content selection is now multi-select instead of a single fixed choice.
 9. Enable sync, exhaust source content, wait 300 seconds, and confirm final scan then completion.
 10. Trigger/rate-limit test only with normal Telegram behavior; confirm FloodWait state and safe resume.
 
-## 19. Product intelligence additions beyond the requested flows
+## 19. Live status refresh, progress bar, and rate-protection wording
+
+### Direct topic-thread retrieval
+
+The first channel-segment implementation scanned the full forum history and filtered for selected-topic messages. This could delay delivery where a forum had a large unrelated history.
+
+It now uses Telegram's direct thread retrieval:
+
+```text
+iter_messages(source, reply_to=selected_topic_id, reverse=True)
+```
+
+Only messages in the selected topic thread are fetched, then sent under that topic's pinned channel header.
+
+### Live refresh control
+
+The live status message now keeps a `🔄 Refresh Live Status` button after worker edits. Users can request an immediate database/worker snapshot without waiting for the scheduled update interval.
+
+### Exact topic progress
+
+Before a one-time channel-segment run, the worker counts selected items across the selected topic threads. Live status can show an exact total, a visual progress bar, percentage, and ETA.
+
+### FloodWait presentation
+
+FloodWait is no longer stored or presented as a backup error.
+
+The user-facing state is:
+
+```text
+🛡️ Telegram pace protection
+Telegram is pacing sends — resuming in Ns
+```
+
+The countdown refreshes every 15 seconds while preserving Pause/Stop handling. The event timeline records it as informational rate protection rather than a failed transfer.
+
+## 20. Product intelligence additions beyond the requested flows
 
 The public version now adds operational capabilities chosen to make the service usable under a shared runtime rather than merely adding more menu buttons.
 

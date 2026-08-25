@@ -724,3 +724,14 @@ class Database:
                 """,
                 (project_id, source_topic_id),
             ).fetchone()
+
+    def project_by_status_message(self, chat_id: int, message_id: int) -> Project | None:
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT * FROM projects
+                WHERE status_message_chat_id = ? AND status_message_id = ?
+                """,
+                (chat_id, message_id),
+            ).fetchone()
+        return self._project_from_row(row) if row else None

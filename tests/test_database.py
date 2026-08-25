@@ -47,6 +47,8 @@ def test_project_transfer_ledger_is_durable_and_deduplicated() -> None:
     assert counters.completed == 1
     assert counters.bytes_transferred == 1024
     assert database.get_project(project.id).status == ProjectStatus.READY
+    database.set_status_message(project.id, 1001, 500)
+    assert database.project_by_status_message(1001, 500).id == project.id
     database.close()
 
 

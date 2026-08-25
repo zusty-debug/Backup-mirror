@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+import time
 from dataclasses import dataclass, field, replace
 
 from telethon import Button, TelegramClient, errors, events, functions
@@ -64,7 +65,9 @@ class TelegramControlBot:
             await self.client.disconnect()
 
     async def edit_message_text(self, text: str, *, chat_id: int, message_id: int) -> None:
-        await self.client.edit_message(chat_id, message_id, self._brand(text), parse_mode="html", buttons=None)
+        project = self.database.project_by_status_message(chat_id, message_id)
+        buttons = [[Button.inline("🔄 Refresh Live Status", f"live:{project.id}".encode())]] if project else None
+        await self.client.edit_message(chat_id, message_id, self._brand(text), parse_mode="html", buttons=buttons)
 
     @staticmethod
     def _brand(text: str) -> str:
@@ -178,6 +181,13 @@ class TelegramControlBot:
             return
         action, _, project_id = data.partition(":")
         project = self.database.get_project(project_id, user_id) if project_id else None
+        if action == "live":
+            if not project:
+                await event.answer("Project not found", alert=True)
+                return
+            await event.answer("Live status refreshed")
+            await self._edit_live_status(event, project)
+            return
         project_actions = {
             "confirm", "cancel", "view", "start", "pause", "stopask", "stop", "status",
             "settings", "caption", "sync", "report", "failed", "activity", "verify", "preview", "retry",
@@ -206,6 +216,7 @@ class TelegramControlBot:
                 event.chat_id,
                 self._brand(f"<b>📡 Live backup status</b>\n📁 Project: <b>{self._esc(project.name)}</b>\n🚀 Preparing…"),
                 parse_mode="html",
+                buttons=[[Button.inline("🔄 Refresh Live Status", f"live:{project.id}".encode())]],
             )
             self.database.set_status_message(project.id, int(event.chat_id), int(status.id))
             start_result = await self.workers.start(project.id)
@@ -788,6 +799,46 @@ class TelegramControlBot:
         projects = self.database.list_projects(user_id)
         await self._edit_reply(event, "<b>My Projects</b>" if projects else "No projects yet.", parse_mode="html", buttons=self._projects_buttons(projects))
 
+    async def _edit_live_status(self, event, project: Project) -> None:
+        counters = self.database.counters(project.id)
+        progress = self.workers.live_progress(project.id)
+        if progress:
+            current = truncate(progress.current_file, 70)
+            phase = progress.phase
+            elapsed = max(0, int(time.monotonic() - progress.started_at))
+            total = progress.total_eligible
+        else:
+            current = "Waiting for worker update"
+            phase = "🛡️ Telegram pace protection" if project.status == ProjectStatus.WAITING_RATE_LIMIT else "⏸️ Not actively running"
+            elapsed = 0
+            total = None
+        processed = counters.completed + (progress.skipped if progress else 0)
+        if total is not None:
+            percentage = min(100.0, processed * 100 / max(1, total))
+            bar = "▰" * round(10 * percentage / 100) + "▱" * (10 - round(10 * percentage / 100))
+            progress_line = f"{bar} {percentage:.1f}%\n📊 {processed:,} / {total:,} processed"
+        else:
+            progress_line = f"📊 {processed:,} processed"
+        state = "🛡️ Telegram pace protection" if project.status == ProjectStatus.WAITING_RATE_LIMIT else project.status.value
+        text = (
+            "<b>📡 Live backup status</b>\n"
+            f"📁 Project: <b>{self._esc(project.name)}</b>\n"
+            f"🔄 State: <code>{state}</code>\n"
+            f"📍 Phase: {self._esc(phase)}\n\n"
+            f"{progress_line}\n"
+            f"✅ Copied: {counters.completed:,}\n"
+            f"⏭️ Skipped: {progress.skipped if progress else 0:,}\n"
+            f"⚠️ Failed: {counters.failed:,}\n"
+            f"📦 Media reused: {readable_bytes(counters.bytes_transferred)}\n"
+            f"⏱️ Elapsed: {elapsed}s\n"
+            f"📌 Current: <code>{self._esc(current)}</code>"
+        )
+        await self._edit_reply(
+            event,
+            text,
+            buttons=[[Button.inline("🔄 Refresh Live Status", f"live:{project.id}".encode())]],
+        )
+
     async def _edit_worker_status(self, event, user_id: int) -> None:
         profile = self.database.worker_profile_summary(user_id)
         if not profile or not profile["connected"]:
@@ -954,9 +1005,10 @@ class TelegramControlBot:
             forum_mode = "Forum topic clone"
         else:
             forum_mode = "Normal chat"
+        status_label = "🛡️ Telegram pace protection" if project.status == ProjectStatus.WAITING_RATE_LIMIT else project.status.value
         base = (
             f"<b>📁 {TelegramControlBot._esc(project.name)}</b>\n"
-            f"🔄 Status: <code>{project.status.value}</code>\n"
+            f"🔄 Status: <code>{status_label}</code>\n"
             f"📥 Source: {TelegramControlBot._esc(project.source_name or project.source_ref)}\n"
             f"📤 Destination: {TelegramControlBot._esc(project.destination_name or project.destination_ref)}\n"
             f"🧭 Start: {project.scan_mode.value}\n"

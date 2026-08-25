@@ -54,6 +54,7 @@ class BackupWorker:
         self.gateway = gateway
         self.bot = bot
         self._last_status: dict[str, float] = {}
+        self._active_progress: dict[str, ScanProgress] = {}
 
     async def run(self, project_id: str) -> None:
         project = self.database.get_project(project_id)
@@ -61,6 +62,7 @@ class BackupWorker:
             return
         run_id = self.database.open_run(project.id)
         progress = ScanProgress()
+        self._active_progress[project.id] = progress
         result = "FAILED"
         try:
             if project.source_chat_id is None or project.destination_chat_id is None:
@@ -126,6 +128,10 @@ class BackupWorker:
                 self.database.close_run(run_id, result, counters)
                 self.database.log_event(project_id, "INFO", f"Backup run finished: {result}")
                 await self._status(project, progress, force=True, final=True)
+            self._active_progress.pop(project_id, None)
+
+    def live_progress(self, project_id: str) -> ScanProgress | None:
+        return self._active_progress.get(project_id)
 
     async def _preflight(self, project: Project) -> None:
         source, destination = await self.gateway.preflight(project.profile_id, project.source_ref, project.destination_ref)
@@ -269,6 +275,24 @@ class BackupWorker:
             )
         )
         topic_by_id = {int(topic.id): topic for topic in getattr(result, "topics", []) if getattr(topic, "id", None)}
+        if progress.total_eligible is None and not project.settings.continuous_sync:
+            progress.phase = "🧮 Counting selected topic content"
+            progress.current_file = "Calculating exact forum topic total"
+            total = 0
+            counted = 0
+            for topic_id in selected:
+                async for message in client.iter_messages(source, reverse=True, reply_to=topic_id):
+                    if not self._within_date_range(project, message):
+                        continue
+                    counted += 1
+                    if self._eligible_media(project, message) is not None:
+                        total += 1
+                    if counted % 250 == 0:
+                        progress.counted_messages = counted
+                        await self._status(project, progress)
+            progress.counted_messages = counted
+            progress.total_eligible = total
+            self.database.log_event(project.id, "INFO", f"Counted {total} selected forum-topic items for progress tracking")
         for topic_id in selected:
             topic = topic_by_id.get(topic_id)
             if not topic:
@@ -887,20 +911,29 @@ class BackupWorker:
         return None
 
     async def _wait_flood(self, project: Project, progress: ScanProgress, seconds: int) -> bool:
-        """Wait for Telegram's requested limit; return True when pause/stop interrupts it."""
+        """Respect Telegram pacing; return True when pause/stop interrupts it."""
         seconds = max(1, int(seconds))
-        self.database.update_project_status(project.id, ProjectStatus.WAITING_RATE_LIMIT, f"FloodWait: {seconds}s")
-        progress.current_file = f"Telegram rate limit — waiting {seconds}s"
+        self.database.update_project_status(project.id, ProjectStatus.WAITING_RATE_LIMIT)
+        progress.phase = "🛡️ Telegram pace protection"
+        progress.current_file = f"Telegram is pacing sends — resuming in {seconds}s"
         await self._status(project, progress, force=True)
-        self.database.log_event(project.id, "WARNING", f"FloodWait: waiting {seconds} seconds")
+        self.database.log_event(project.id, "INFO", f"Telegram pace protection active: waiting {seconds} seconds")
         remaining = seconds
+        last_refresh = seconds
         while remaining > 0:
             await asyncio.sleep(min(remaining, 5))
-            remaining -= 5
+            remaining = max(0, remaining - 5)
             state = self._reload(project.id).status
             if state in {ProjectStatus.PAUSE_REQUESTED, ProjectStatus.STOP_REQUESTED}:
                 return True
+            # Refresh the user-facing countdown every 15 seconds without
+            # over-editing Telegram status messages.
+            if last_refresh - remaining >= 15 or remaining == 0:
+                progress.current_file = f"Telegram is pacing sends — resuming in {remaining}s"
+                await self._status(project, progress, force=True)
+                last_refresh = remaining
         self.database.update_project_status(project.id, ProjectStatus.RUNNING)
+        progress.phase = "⚡ Sending fresh Telegram media"
         return False
 
     async def _at_control_boundary(self, project_id: str, progress: ScanProgress) -> bool:
@@ -946,10 +979,12 @@ class BackupWorker:
         elapsed_text = self._readable_duration(elapsed)
         copied_or_skipped = counters.completed + progress.skipped
         progress_line = f"{copied_or_skipped:,} processed"
+        progress_bar = ""
         eta_line = "⏳ ETA: calculating…"
-        if progress.total_eligible:
-            percentage = min(100.0, copied_or_skipped * 100 / progress.total_eligible)
+        if progress.total_eligible is not None:
+            percentage = min(100.0, copied_or_skipped * 100 / max(1, progress.total_eligible))
             progress_line = f"{copied_or_skipped:,} / {progress.total_eligible:,} ({percentage:.1f}%)"
+            progress_bar = f"{self._progress_bar(percentage)} {percentage:.1f}%"
             item_rate = copied_or_skipped / elapsed
             remaining = max(0, progress.total_eligible - copied_or_skipped)
             eta_line = f"⏳ ETA: {self._readable_duration(remaining / item_rate)}" if item_rate > 0 else "⏳ ETA: calculating…"
@@ -961,6 +996,7 @@ class BackupWorker:
             f"🔄 State: <code>{state}</code>\n"
             f"📍 Phase: {self._escape(progress.phase)}\n\n"
             f"📊 Progress: {progress_line}\n"
+            f"{progress_bar + chr(10) if progress_bar else ''}"
             f"🔎 Source messages scanned: {progress.scanned:,}\n"
             f"🎞️ Media/files found: {progress.eligible:,}\n"
             f"✅ Copied: {counters.completed:,}\n"
@@ -1001,6 +1037,11 @@ class BackupWorker:
         return truncate(f"{exc.__class__.__name__}: {exc}", 500)
 
     @staticmethod
+    def _progress_bar(percentage: float, width: int = 10) -> str:
+        filled = max(0, min(width, round(width * percentage / 100)))
+        return "▰" * filled + "▱" * (width - filled)
+
+    @staticmethod
     def _readable_duration(seconds: float) -> str:
         total = max(0, int(seconds))
         hours, remainder = divmod(total, 3600)
@@ -1039,6 +1080,9 @@ class WorkerManager:
             return self.queued_project_ids.index(project_id) + 1
         except ValueError:
             return None
+
+    def live_progress(self, project_id: str) -> ScanProgress | None:
+        return self.worker.live_progress(project_id)
 
     def _owner_active_count(self, owner_id: int) -> int:
         active = 0
