@@ -12,6 +12,8 @@ def _parse_owner_ids(value: object) -> tuple[int, ...]:
         return value
     if isinstance(value, list):
         return tuple(int(item) for item in value)
+    if isinstance(value, int):
+        return (value,)
     if isinstance(value, str):
         return tuple(int(item.strip()) for item in value.split(",") if item.strip())
     raise ValueError("OWNER_IDS must be a comma-separated list of numeric Telegram user IDs")
