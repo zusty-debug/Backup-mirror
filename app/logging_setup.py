@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 
 
 class SecretRedactionFilter(logging.Filter):
@@ -22,11 +23,16 @@ class SecretRedactionFilter(logging.Filter):
         return True
 
 
-def configure_logging(level: str) -> None:
-    handler = logging.StreamHandler()
-    handler.addFilter(SecretRedactionFilter())
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+def configure_logging(level: str, log_file: Path | None = None) -> None:
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(level.upper())
-    root.addHandler(handler)
+    for handler in handlers:
+        handler.addFilter(SecretRedactionFilter())
+        handler.setFormatter(formatter)
+        root.addHandler(handler)

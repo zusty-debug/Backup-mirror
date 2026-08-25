@@ -41,7 +41,7 @@ def cleanup_temp_directory(settings: Settings) -> int:
 async def run() -> None:
     settings = Settings()
     settings.prepare_directories()
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, settings.data_dir / "bot.log")
     database = Database(settings.database_path)
     database.initialize()
     retryable = database.cleanup_incomplete_items()
