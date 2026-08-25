@@ -32,6 +32,7 @@ def build_project_report(database: Database, project: Project, report_dir: Path)
         f"- Skip duplicates: {project.settings.skip_duplicates}",
         f"- Continuous sync: {project.settings.continuous_sync}",
         f"- Checksum enabled: {project.settings.checksum_enabled}",
+        f"- Transfer mode: {'Telegram server-side fresh send' if project.settings.server_side_copy else 'Download and re-upload'}",
         "",
         "## Results",
         "",

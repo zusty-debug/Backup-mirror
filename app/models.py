@@ -71,6 +71,9 @@ class ProjectSettings:
     skip_duplicates: bool = True
     ordering: str = "OLDEST_FIRST"
     checksum_enabled: bool = False
+    # Reuse Telegram's existing media object in a fresh SendMedia message.
+    # This avoids local download/re-upload and never uses forwarding APIs.
+    server_side_copy: bool = True
     continuous_sync: bool = False
 
     def allows(self, media_type: MediaType) -> bool:

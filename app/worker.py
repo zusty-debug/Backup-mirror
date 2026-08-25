@@ -208,7 +208,94 @@ class BackupWorker:
         # Telegram media groups accept up to 10 items. Split defensively if the source contains more.
         for offset in range(0, len(selected), 10):
             group = selected[offset : offset + 10]
-            await self._album_with_retry(project, client, destination, group, progress)
+            if project.settings.server_side_copy and not project.settings.checksum_enabled:
+                await self._server_copy_album_with_retry(project, client, destination, group, progress)
+            else:
+                await self._album_with_retry(project, client, destination, group, progress)
+
+    async def _server_copy_album_with_retry(
+        self,
+        project: Project,
+        client,
+        destination,
+        group: list[tuple[Message, MediaType]],
+        progress: ScanProgress,
+    ) -> None:
+        """Create a new destination album by reusing source media on Telegram's servers.
+
+        Unlike forwarding, this invokes SendMedia and produces fresh destination
+        messages without a forward header. No file bytes pass through this server.
+        """
+        attempt = 0
+        source_chat_id = int(project.source_chat_id)
+        while attempt < self.settings.max_upload_retries:
+            try:
+                for message, media_type in group:
+                    filename = self._message_filename(message, media_type)
+                    size = int(getattr(getattr(message, "file", None), "size", 0) or 0)
+                    progress.current_file = filename
+                    self.database.begin_transfer(
+                        project_id=project.id,
+                        source_chat_id=source_chat_id,
+                        source_message_id=int(message.id),
+                        media_type=media_type.value,
+                        file_name=filename,
+                        file_size=size,
+                        status=TransferStatus.UPLOADING,
+                    )
+                captions = [message.message or "" if project.settings.preserve_captions else "" for message, _ in group]
+                sent = await client.send_file(
+                    destination,
+                    [message.media for message, _ in group],
+                    caption=captions,
+                    parse_mode=None,
+                    allow_cache=False,
+                )
+                sent_messages = sent if isinstance(sent, list) else [sent]
+                if len(sent_messages) != len(group):
+                    raise RuntimeError("Telegram did not return all destination album messages")
+                for (message, _), destination_message in zip(group, sent_messages, strict=True):
+                    self.database.complete_transfer(
+                        project_id=project.id,
+                        source_chat_id=source_chat_id,
+                        source_message_id=int(message.id),
+                        destination_chat_id=int(project.destination_chat_id),
+                        destination_message_id=int(destination_message.id),
+                        checksum_sha256=None,
+                    )
+                    progress.bytes_this_run += int(getattr(getattr(message, "file", None), "size", 0) or 0)
+                return
+            except errors.FloodWaitError as exc:
+                if await self._wait_flood(project, progress, exc.seconds):
+                    for message, _ in group:
+                        self.database.mark_transfer(
+                            project.id,
+                            source_chat_id,
+                            int(message.id),
+                            TransferStatus.RETRY_WAIT,
+                            "Interrupted during FloodWait",
+                        )
+                    return
+            except Exception as exc:
+                attempt += 1
+                if attempt >= self.settings.max_upload_retries:
+                    for message, media_type in group:
+                        self.database.begin_transfer(
+                            project_id=project.id,
+                            source_chat_id=source_chat_id,
+                            source_message_id=int(message.id),
+                            media_type=media_type.value,
+                            file_name=self._message_filename(message, media_type),
+                            file_size=int(getattr(getattr(message, "file", None), "size", 0) or 0),
+                            status=TransferStatus.RETRY_WAIT,
+                        )
+                        self.database.mark_transfer(
+                            project.id, source_chat_id, int(message.id), TransferStatus.FAILED, self._error_text(exc)
+                        )
+                    progress.failed_this_run += len(group)
+                    self.database.log_event(project.id, "ERROR", f"Server-copy album: {self._error_text(exc)}")
+                    return
+                await asyncio.sleep(min(2**attempt, 20))
 
     async def _album_with_retry(self, project: Project, client, destination, group: list[tuple[Message, MediaType]], progress: ScanProgress) -> None:
         attempt = 0
@@ -287,9 +374,93 @@ class BackupWorker:
             finally:
                 self._delete_downloads(files)
 
+    async def _server_copy_with_retry(
+        self,
+        project: Project,
+        client,
+        destination,
+        message: Message,
+        media_type: MediaType,
+        progress: ScanProgress,
+    ) -> None:
+        """Send an existing source media object as a fresh destination message.
+
+        Telethon turns ``message.media`` into Telegram's InputMedia document/photo
+        reference and calls SendMedia. This is server-side media reuse, not a
+        ForwardMessages call and not a local download/re-upload.
+        """
+        attempt = 0
+        source_chat_id = int(project.source_chat_id)
+        filename = self._message_filename(message, media_type)
+        size = int(getattr(getattr(message, "file", None), "size", 0) or 0)
+        progress.current_file = filename
+        while attempt < self.settings.max_upload_retries:
+            try:
+                self.database.begin_transfer(
+                    project_id=project.id,
+                    source_chat_id=source_chat_id,
+                    source_message_id=int(message.id),
+                    media_type=media_type.value,
+                    file_name=filename,
+                    file_size=size,
+                    status=TransferStatus.UPLOADING,
+                )
+                caption = message.message or "" if project.settings.preserve_captions else None
+                sent = await client.send_file(
+                    destination,
+                    message.media,
+                    caption=caption,
+                    parse_mode=None,
+                    allow_cache=False,
+                )
+                self.database.complete_transfer(
+                    project_id=project.id,
+                    source_chat_id=source_chat_id,
+                    source_message_id=int(message.id),
+                    destination_chat_id=int(project.destination_chat_id),
+                    destination_message_id=int(sent.id),
+                    checksum_sha256=None,
+                )
+                progress.bytes_this_run += size
+                return
+            except errors.FloodWaitError as exc:
+                if await self._wait_flood(project, progress, exc.seconds):
+                    self.database.mark_transfer(
+                        project.id,
+                        source_chat_id,
+                        int(message.id),
+                        TransferStatus.RETRY_WAIT,
+                        "Interrupted during FloodWait",
+                    )
+                    return
+            except Exception as exc:
+                attempt += 1
+                if attempt >= self.settings.max_upload_retries:
+                    self.database.mark_transfer(
+                        project.id,
+                        source_chat_id,
+                        int(message.id),
+                        TransferStatus.FAILED,
+                        self._error_text(exc),
+                    )
+                    progress.failed_this_run += 1
+                    self.database.log_event(project.id, "ERROR", f"Server-copy message {message.id}: {self._error_text(exc)}")
+                    return
+                self.database.mark_transfer(
+                    project.id,
+                    source_chat_id,
+                    int(message.id),
+                    TransferStatus.RETRY_WAIT,
+                    self._error_text(exc),
+                )
+                await asyncio.sleep(min(2**attempt, 20))
+
     async def _transfer_with_retry(
         self, project: Project, client, destination, message: Message, media_type: MediaType, progress: ScanProgress
     ) -> None:
+        if project.settings.server_side_copy and not project.settings.checksum_enabled:
+            await self._server_copy_with_retry(project, client, destination, message, media_type, progress)
+            return
         attempt = 0
         while attempt < self.settings.max_upload_retries:
             item: DownloadedMedia | None = None
