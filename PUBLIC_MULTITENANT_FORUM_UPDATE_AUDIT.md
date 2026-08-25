@@ -372,6 +372,25 @@ If a project has not been scanned, pressing Start prompts the user to scan first
 - During a FloodWait, two separate bars are shown: overall approved-message progress and a countdown bar for Telegram's pacing window.
 - Every live backup card retains a `🔄 Refresh Live Status` button for an immediate snapshot, while automatic updates continue every two seconds.
 
+### Clear sent-versus-pending accounting
+
+Live status now separates the count users care about:
+
+- `Valid selected items found this pass`;
+- `Sent this pass`;
+- `Pending/retrying this pass`;
+- `Already copied (resume protection)`;
+- `Failed`.
+
+When selected items are not sent yet, the bot shows the reason. For example, an incomplete album during a Telegram cooldown is displayed as:
+
+```text
+Pending/retrying this pass: 10
+Pending reason: Telegram pace protection — will retry automatically
+```
+
+This prevents a temporary Telegram cooldown from looking like messages were skipped.
+
 ### Detailed media filters
 
 The project Settings page now includes `🎛️ Media Filters`, allowing a user to enable/disable independently:

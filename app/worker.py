@@ -28,6 +28,7 @@ class ScanProgress:
     skipped: int = 0
     failed_this_run: int = 0
     bytes_this_run: int = 0
+    completed_at_start: int = 0
     current_file: str = "Preparing…"
     phase: str = "🚀 Preparing"
     total_eligible: int | None = None
@@ -72,6 +73,7 @@ class BackupWorker:
                 await self._preflight(project)
                 project = self._reload(project.id)
             self.database.update_project_status(project.id, ProjectStatus.RUNNING)
+            progress.completed_at_start = self.database.counters(project.id).completed
             plan = self.database.project_plan(project.id)
             if plan:
                 progress.total_eligible = int(plan["selected_total"])
@@ -1032,6 +1034,18 @@ class BackupWorker:
         title = "✅ Backup completed" if final and raw_state == ProjectStatus.COMPLETED.value else "📡 Live backup status"
         elapsed_text = self._readable_duration(elapsed)
         copied_or_skipped = counters.completed + progress.skipped
+        sent_this_run = max(0, counters.completed - progress.completed_at_start)
+        pending_this_pass = max(
+            0,
+            progress.eligible - sent_this_run - progress.skipped - progress.failed_this_run,
+        )
+        if pending_this_pass:
+            if progress.rate_wait_remaining is not None:
+                pending_reason = "Telegram pace protection — will retry automatically"
+            else:
+                pending_reason = "Current album/request is still being processed"
+        else:
+            pending_reason = "All currently discovered items are accounted for"
         progress_line = f"{copied_or_skipped:,} processed"
         progress_bar = ""
         eta_line = "⏳ ETA: calculating…"
@@ -1059,9 +1073,11 @@ class BackupWorker:
             f"📊 Progress: {progress_line}\n"
             f"{progress_bar + chr(10) if progress_bar else ''}"
             f"{rate_bar_line}"
-            f"🔎 Source messages scanned: {progress.scanned:,}\n"
-            f"🎞️ Media/files found: {progress.eligible:,}\n"
-            f"✅ Sent: {counters.completed:,}\n"
+            f"🔎 Source messages scanned this pass: {progress.scanned:,}\n"
+            f"🎞️ Valid selected items found this pass: {progress.eligible:,}\n"
+            f"✅ Sent this pass: {sent_this_run:,}\n"
+            f"🟡 Pending/retrying this pass: {pending_this_pass:,}\n"
+            f"📌 Pending reason: {self._escape(pending_reason)}\n"
             f"♻️ Already copied (resume protection): {progress.skipped:,}\n"
             f"⚠️ Failed: {max(counters.failed, progress.failed_this_run):,}\n"
             f"📦 Media reused: {readable_bytes(counters.bytes_transferred)}\n"

@@ -915,6 +915,11 @@ class TelegramControlBot:
             phase = "🛡️ Telegram pace protection" if project.status == ProjectStatus.WAITING_RATE_LIMIT else "⏸️ Not actively running"
             elapsed = 0
             total = None
+        sent_this_run = max(0, counters.completed - progress.completed_at_start) if progress else counters.completed
+        pending_this_pass = max(
+            0,
+            progress.eligible - sent_this_run - progress.skipped - progress.failed_this_run,
+        ) if progress else 0
         processed = counters.completed + (progress.skipped if progress else 0)
         if total is not None:
             percentage = min(100.0, processed * 100 / max(1, total))
@@ -934,7 +939,8 @@ class TelegramControlBot:
             f"🔄 State: <code>{state}</code>\n"
             f"📍 Phase: {self._esc(phase)}\n\n"
             f"{progress_line}{rate_line}\n"
-            f"✅ Sent: {counters.completed:,}\n"
+            f"✅ Sent this pass: {sent_this_run:,}\n"
+            f"🟡 Pending/retrying this pass: {pending_this_pass:,}\n"
             f"♻️ Already copied: {progress.skipped if progress else 0:,}\n"
             f"⚠️ Failed: {counters.failed:,}\n"
             f"📦 Media reused: {readable_bytes(counters.bytes_transferred)}\n"
