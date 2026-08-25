@@ -49,7 +49,10 @@ class MediaType(StrEnum):
     AUDIO = "AUDIO"
     VOICE = "VOICE"
     VIDEO_NOTE = "VIDEO_NOTE"
+    GIF = "GIF"
     STICKER = "STICKER"
+    LINK = "LINK"
+    TEXT = "TEXT"
     OTHER = "OTHER"
 
 
@@ -63,9 +66,13 @@ class ProjectSettings:
             MediaType.AUDIO,
             MediaType.VOICE,
             MediaType.VIDEO_NOTE,
+            MediaType.GIF,
+            MediaType.STICKER,
             MediaType.OTHER,
         ]
     )
+    # FILES, MEDIA, LINKS, MEDIA_FILES, MEDIA_FILES_LINKS, or EVERYTHING.
+    content_mode: str = "MEDIA_FILES_LINKS"
     preserve_captions: bool = False
     preserve_albums: bool = True
     skip_duplicates: bool = True
@@ -78,8 +85,38 @@ class ProjectSettings:
     # When sync is enabled and a scan finds no media, wait this long once,
     # perform one final scan, then complete if it is still idle.
     idle_stop_seconds: int = 300
+    clone_forum_topics: bool = False
 
     def allows(self, media_type: MediaType) -> bool:
+        mode = self.content_mode.upper()
+        allowed_values = {str(value) for value in self.media_types}
+        if media_type not in {MediaType.TEXT, MediaType.LINK} and media_type.value not in allowed_values:
+            return False
+        files = {MediaType.DOCUMENT}
+        media = {
+            MediaType.PHOTO,
+            MediaType.VIDEO,
+            MediaType.AUDIO,
+            MediaType.VOICE,
+            MediaType.VIDEO_NOTE,
+            MediaType.GIF,
+            MediaType.STICKER,
+            MediaType.OTHER,
+        }
+        if mode == "EVERYTHING":
+            return True
+        if media_type == MediaType.LINK:
+            return mode in {"LINKS", "MEDIA_FILES_LINKS"}
+        if media_type == MediaType.TEXT:
+            return False
+        if mode == "LINKS":
+            return False
+        if mode == "FILES":
+            return media_type in files
+        if mode == "MEDIA":
+            return media_type in media
+        if mode in {"MEDIA_FILES", "MEDIA_FILES_LINKS"}:
+            return media_type in files | media
         return media_type.value in {str(value) for value in self.media_types}
 
     def to_json(self) -> str:

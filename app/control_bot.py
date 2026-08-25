@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import html
 import logging
+import re
 from dataclasses import dataclass, field, replace
 
-from telethon import Button, TelegramClient, events
+from telethon import Button, TelegramClient, events, functions
+from telethon.errors import RPCError
 from telethon.sessions import StringSession
 
 from .config import Settings
@@ -77,7 +79,12 @@ class TelegramControlBot:
         kwargs.setdefault("parse_mode", "html")
         return await event.edit(self._brand(text), *args, **kwargs)
 
-    def _allowed(self, user_id: int | None) -> bool:
+    @staticmethod
+    def _allowed(user_id: int | None) -> bool:
+        # Public service: every real Telegram user can create isolated projects.
+        return bool(user_id)
+
+    def _is_admin(self, user_id: int | None) -> bool:
         return bool(user_id and user_id in self.settings.owner_ids)
 
     async def _on_message(self, event: events.NewMessage.Event) -> None:
@@ -138,13 +145,25 @@ class TelegramControlBot:
             await event.answer()
             await self._edit_worker_status(event, user_id)
             return
-        if data in {"admin", "admin:refresh"}:
+        if data in {"admin", "admin:refresh", "admin:workers", "admin:active"}:
+            if not self._is_admin(user_id):
+                await event.answer("Admin access only", alert=True)
+                return
             await event.answer()
-            await self._edit_admin_panel(event, user_id)
+            if data == "admin:workers":
+                await self._edit_admin_workers(event)
+            elif data == "admin:active":
+                await self._edit_admin_active_projects(event)
+            else:
+                await self._edit_admin_panel(event, user_id)
             return
         if data == "help":
             await event.answer()
             await self._reply(event, self._help_text(), parse_mode="html")
+            return
+        if data.startswith("content:"):
+            await event.answer()
+            await self._choose_content(event, user_id, data.split(":", 1)[1])
             return
         if data.startswith("mode:"):
             await event.answer()
@@ -304,7 +323,11 @@ class TelegramControlBot:
         elif flow.stage == "source":
             flow.data["source_ref"] = text
             flow.stage = "destination"
-            await self._reply(event, "Send the destination channel/group username, numeric ID, or Telegram link.")
+            await self._reply(
+                event,
+                "Send the destination channel/group username, numeric ID, or Telegram link.\n\n"
+                "For a forum source, you may instead send <code>CREATE_FORUM</code> to create a new forum clone with matching topics.",
+            )
         elif flow.stage == "destination":
             flow.data["destination_ref"] = text
             flow.stage = "name"
@@ -315,12 +338,14 @@ class TelegramControlBot:
                 await self._reply(event, "Project name cannot be empty.")
                 return
             flow.data["name"] = name[:100]
-            flow.stage = "mode"
-            await self._reply(event, 
-                "Choose scan mode.",
+            flow.stage = "content"
+            await self._reply(
+                event,
+                "<b>📦 Choose content to copy</b>\n\nEach item is sent as a fresh destination message — never forwarded.",
                 buttons=[
-                    [Button.inline("Full Backup", b"mode:full")],
-                    [Button.inline("New Files Only / Sync", b"mode:new")],
+                    [Button.inline("📄 Files only", b"content:files"), Button.inline("🎞️ Media only", b"content:media")],
+                    [Button.inline("🔗 Links only", b"content:links"), Button.inline("📦 Media + Files + Links", b"content:media_files_links")],
+                    [Button.inline("✨ Everything (text, replies, GIFs, stickers)", b"content:everything")],
                 ],
             )
         elif flow.stage == "message_id":
@@ -329,44 +354,131 @@ class TelegramControlBot:
                 if int(text) <= 0:
                     raise ValueError
             except ValueError:
-                await self._reply(event, "Send a positive message ID.")
+                await self._reply(event, "Send a positive message ID or a Telegram message link.")
                 return
             await self._create_project(event, user_id, flow)
+        elif flow.stage == "start_link":
+            message_id = self._message_id_from_reference(text)
+            if not message_id:
+                await self._reply(event, "Send a valid Telegram message link or a positive message ID.")
+                return
+            flow.data["start_message_id"] = message_id
+            await self._create_project(event, user_id, flow)
+    async def _choose_content(self, event: events.CallbackQuery.Event, user_id: int, choice: str) -> None:
+        flow = self.flows.get(user_id)
+        if not flow or flow.stage != "content":
+            await event.answer("Start a new project again", alert=True)
+            return
+        content_modes = {
+            "files": "FILES",
+            "media": "MEDIA",
+            "links": "LINKS",
+            "media_files_links": "MEDIA_FILES_LINKS",
+            "everything": "EVERYTHING",
+        }
+        mode = content_modes.get(choice)
+        if not mode:
+            await event.answer("Invalid content mode", alert=True)
+            return
+        flow.data["settings"] = ProjectSettings(
+            content_mode=mode,
+            preserve_captions=mode == "EVERYTHING",
+        )
+        flow.stage = "mode"
+        await self._edit_reply(
+            event,
+            "<b>🧭 Choose where to start</b>\n\n"
+            "Custom start is available for channels and regular groups. "
+            "Forum-topic copies always start from the beginning of the selected topics.",
+            buttons=[
+                [Button.inline("⏮️ From the beginning", b"mode:full")],
+                [Button.inline("🆕 New media only + 300s idle stop", b"mode:new")],
+                [Button.inline("📍 Custom message link / ID", b"mode:custom")],
+            ],
+        )
 
     async def _choose_mode(self, event: events.CallbackQuery.Event, user_id: int, choice: str) -> None:
         flow = self.flows.get(user_id)
         if not flow or flow.stage != "mode":
             await event.answer("Start a new project again", alert=True)
             return
+        settings = flow.data.get("settings", ProjectSettings())
         if choice == "full":
             flow.data["scan_mode"] = ScanMode.FULL
-            flow.data["settings"] = ProjectSettings()
             await self._create_project(event, user_id, flow)
         elif choice == "new":
             flow.data["scan_mode"] = ScanMode.NEW_FILES_ONLY
-            flow.data["settings"] = ProjectSettings(continuous_sync=True)
+            flow.data["settings"] = replace(settings, continuous_sync=True)
             await self._create_project(event, user_id, flow)
+        elif choice == "custom":
+            flow.data["scan_mode"] = ScanMode.FROM_MESSAGE_ID
+            flow.stage = "start_link"
+            await self._reply(event, "📍 Send the first source message ID or its Telegram message link.")
+
+    @staticmethod
+    def _message_id_from_reference(value: str) -> int | None:
+        match = re.search(r"(?:^|/)(\d+)(?:\?.*)?$", value.strip())
+        if match:
+            return int(match.group(1))
+        return int(value) if value.strip().isdigit() and int(value) > 0 else None
 
     async def _create_project(self, event, user_id: int, flow: Flow) -> None:
+        destination_ref = str(flow.data["destination_ref"])
+        settings = flow.data.get("settings", ProjectSettings())
         project = Project.draft(
             owner_id=user_id,
             profile_id=self.gateway.default_profile_id(user_id),
             name=str(flow.data["name"]),
             source_ref=str(flow.data["source_ref"]),
-            destination_ref=str(flow.data["destination_ref"]),
+            destination_ref=destination_ref,
             scan_mode=flow.data.get("scan_mode", ScanMode.FULL),
-            settings=flow.data.get("settings", ProjectSettings()),
+            settings=settings,
         )
         project.start_message_id = flow.data.get("start_message_id")
-        self.database.create_project(project)
         try:
-            source, destination = await self.gateway.preflight(project.profile_id, project.source_ref, project.destination_ref)
-            self.database.update_project_resolution(project.id, int(source.id), self.gateway.entity_name(source), int(destination.id), self.gateway.entity_name(destination))
+            if destination_ref.upper() == "CREATE_FORUM":
+                async with self.gateway.client_for_profile(project.profile_id) as client:
+                    source = await self.gateway.resolve_entity(client, project.source_ref)
+                    if not getattr(source, "forum", False):
+                        raise TelegramGatewayError("CREATE_FORUM can only be used when the source is a forum group with topics.")
+                    if project.scan_mode == ScanMode.FROM_MESSAGE_ID:
+                        raise TelegramGatewayError("Custom start link/ID is not available for forum-topic copies.")
+                    created = await client(
+                        functions.channels.CreateChannelRequest(
+                            title=f"{self.gateway.entity_name(source)} Backup"[:128],
+                            about="Media mirror forum clone",
+                            megagroup=True,
+                            forum=True,
+                        )
+                    )
+                    destination = created.chats[0]
+                    project.destination_ref = f"-100{destination.id}"
+                    project.settings = replace(project.settings, clone_forum_topics=True)
+                    self.database.create_project(project)
+                    self.database.update_project_resolution(
+                        project.id,
+                        int(source.id),
+                        self.gateway.entity_name(source),
+                        int(destination.id),
+                        self.gateway.entity_name(destination),
+                    )
+            else:
+                self.database.create_project(project)
+                source, destination = await self.gateway.preflight(project.profile_id, project.source_ref, project.destination_ref)
+                if project.scan_mode == ScanMode.FROM_MESSAGE_ID and getattr(source, "forum", False):
+                    raise TelegramGatewayError("Custom start link/ID is available only for channels and groups with topics disabled.")
+                self.database.update_project_resolution(
+                    project.id,
+                    int(source.id),
+                    self.gateway.entity_name(source),
+                    int(destination.id),
+                    self.gateway.entity_name(destination),
+                )
             if project.scan_mode == ScanMode.NEW_FILES_ONLY:
                 latest = await self.gateway.latest_message_id(project.profile_id, project.source_ref)
                 if latest:
                     self.database.update_project_checkpoint(project.id, latest)
-        except (TelegramGatewayError, ProfileNotConnectedError) as exc:
+        except (TelegramGatewayError, ProfileNotConnectedError, RPCError) as exc:
             self.database.delete_project(project.id, user_id)
             await self._reply(event, f"Project validation failed: <code>{self._esc(str(exc))}</code>", parse_mode="html")
             return
@@ -383,9 +495,11 @@ class TelegramControlBot:
             [
                 [Button.inline("🚀 New Backup Project", b"project:new")],
                 [Button.inline("📂 My Projects", b"project:list"), Button.inline("👤 Worker Status", b"worker:status")],
-                [Button.inline("🛠️ Admin Panel", b"admin"), Button.inline("ℹ️ Help", b"help")],
             ]
         )
+        if self._is_admin(event.sender_id):
+            buttons.append([Button.inline("🛠️ Admin Panel", b"admin")])
+        buttons.append([Button.inline("ℹ️ Help", b"help")])
         await self._reply(event, text, parse_mode="html", buttons=buttons)
 
     async def _send_projects(self, event, user_id: int) -> None:
@@ -445,15 +559,21 @@ class TelegramControlBot:
         completed = summary.get(ProjectStatus.COMPLETED.value, 0)
         failed = summary.get(ProjectStatus.FAILED.value, 0)
         worker_state = "🟢 Session connected" if profile and profile["connected"] else "🔴 No worker session"
+        global_stats = self.database.global_admin_summary()
         text = (
             "<b>🛠️ Admin Control Center</b>\n\n"
-            f"📁 Total projects: {total}\n"
+            f"🌐 Public users: {global_stats['users']}\n"
+            f"🔐 Connected worker sessions: {global_stats['worker_sessions']}\n"
+            f"📁 All projects: {global_stats['projects']}\n"
+            f"🟢 All running/rate-limited: {global_stats['running']}\n\n"
+            "<b>📌 Your Projects</b>\n"
+            f"📁 Total: {total}\n"
             f"🟢 Running / rate-limited: {running}\n"
             f"⏸️ Paused: {paused}\n"
             f"✅ Completed: {completed}\n"
             f"⚠️ Failed: {failed}\n"
             f"👷 Active worker tasks: {sum(1 for task in self.workers.tasks.values() if not task.done())}\n"
-            f"👤 Worker account: {worker_state}\n\n"
+            f"👤 Your worker: {worker_state}\n\n"
             "Use the buttons below to inspect projects and worker health."
         )
         await self._edit_reply(
@@ -461,10 +581,38 @@ class TelegramControlBot:
             text,
             buttons=[
                 [Button.inline("🔄 Refresh Dashboard", b"admin:refresh")],
-                [Button.inline("📂 My Projects", b"project:list"), Button.inline("👤 Worker Status", b"worker:status")],
+                [Button.inline("📡 Active Projects", b"admin:active"), Button.inline("👥 Worker Sessions", b"admin:workers")],
+                [Button.inline("📂 My Projects", b"project:list"), Button.inline("👤 My Worker", b"worker:status")],
                 [Button.inline("➕ New Project", b"project:new")],
             ],
         )
+
+    async def _edit_admin_workers(self, event) -> None:
+        rows = self.database.admin_worker_profiles()
+        lines = ["<b>👥 Public Worker Sessions</b>", ""]
+        if not rows:
+            lines.append("No worker sessions connected yet.")
+        else:
+            for row in rows:
+                lines.append(
+                    f"🟢 <code>{row['owner_id']}</code> · <code>{self._esc(str(row['phone_hint'] or 'Unknown'))}</code>\n"
+                    f"   Updated: <code>{self._esc(str(row['updated_at']))}</code>"
+                )
+        await self._edit_reply(event, "\n".join(lines), buttons=[[Button.inline("⬅️ Admin Panel", b"admin")]])
+
+    async def _edit_admin_active_projects(self, event) -> None:
+        rows = self.database.admin_active_projects()
+        lines = ["<b>📡 Active Public Projects</b>", ""]
+        if not rows:
+            lines.append("No active projects right now.")
+        else:
+            for row in rows:
+                lines.append(
+                    f"🔄 <b>{self._esc(str(row['name']))}</b> · <code>{self._esc(str(row['status']))}</code>\n"
+                    f"   Owner: <code>{row['owner_id']}</code>\n"
+                    f"   {self._esc(str(row['source_name'] or 'Source'))} → {self._esc(str(row['destination_name'] or 'Destination'))}"
+                )
+        await self._edit_reply(event, "\n".join(lines), buttons=[[Button.inline("⬅️ Admin Panel", b"admin")]])
 
     @staticmethod
     def _projects_buttons(projects: list[Project]):
@@ -498,6 +646,8 @@ class TelegramControlBot:
         text = (
             f"<b>⚙️ Settings — {self._esc(project.name)}</b>\n\n"
             "⚡ Transfer: Telegram server-side fresh send\n"
+            f"📦 Content mode: {settings.content_mode}\n"
+            f"🧵 Forum topic clone: {'On' if settings.clone_forum_topics else 'Off'}\n"
             f"📝 Captions: {'Preserved' if settings.preserve_captions else 'Removed'}\n"
             f"🔄 Continuous sync: {'Enabled' if settings.continuous_sync else 'Disabled'}\n"
             f"⏲️ Idle stop timer: {settings.idle_stop_seconds}s\n\n"
@@ -521,8 +671,10 @@ class TelegramControlBot:
             f"🔄 Status: <code>{project.status.value}</code>\n"
             f"📥 Source: {TelegramControlBot._esc(project.source_name or project.source_ref)}\n"
             f"📤 Destination: {TelegramControlBot._esc(project.destination_name or project.destination_ref)}\n"
-            f"🧭 Mode: {project.scan_mode.value}\n"
+            f"🧭 Start: {project.scan_mode.value}\n"
+            f"📦 Content: {project.settings.content_mode}\n"
             "⚡ Transfer: Telegram server-side fresh send\n"
+            f"🧵 Forum topics: {'Clone enabled' if project.settings.clone_forum_topics else 'Normal chat'}\n"
             f"📝 Captions: {'On' if project.settings.preserve_captions else 'Off'} · "
             f"🔄 Sync: {'On' if project.settings.continuous_sync else 'Off'}"
         )

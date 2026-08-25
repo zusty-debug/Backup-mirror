@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
-from telethon import errors
+from telethon import errors, functions
 from telethon.tl.custom.message import Message
 
 from .config import Settings
@@ -140,6 +141,7 @@ class BackupWorker:
         async with self.gateway.client_for_profile(project.profile_id) as client:
             source = await self.gateway.resolve_entity(client, project.source_ref)
             destination = await self.gateway.resolve_entity(client, project.destination_ref)
+            await self._ensure_forum_topics(project, client, source, destination, progress)
             # Retry items that were left failed/retryable before moving past the saved checkpoint.
             for message_id in self.database.retryable_source_message_ids(project.id):
                 message = await client.get_messages(source, ids=message_id)
@@ -178,6 +180,55 @@ class BackupWorker:
                 await self._process_batch(project, client, destination, album, progress)
                 self.database.update_project_checkpoint(project.id, int(album[-1].id))
 
+    async def _ensure_forum_topics(self, project: Project, client, source, destination, progress: ScanProgress) -> None:
+        if not getattr(source, "forum", False):
+            return
+        if not getattr(destination, "forum", False):
+            raise TelegramGatewayError("Source is a forum group but destination is not a forum group.")
+        if not project.settings.clone_forum_topics:
+            return
+        progress.phase = "🧵 Matching forum topics"
+        result = await client(
+            functions.messages.GetForumTopicsRequest(
+                peer=source,
+                offset_date=None,
+                offset_id=0,
+                offset_topic=0,
+                limit=100,
+                q=None,
+            )
+        )
+        for topic in getattr(result, "topics", []):
+            source_topic_id = int(topic.id)
+            if self.database.destination_topic_id(project.id, source_topic_id):
+                continue
+            # Telegram's General topic exists automatically in every forum.
+            if source_topic_id == 1:
+                self.database.save_forum_topic(project.id, 1, 1, getattr(topic, "title", "General"))
+                continue
+            created = await client(
+                functions.messages.CreateForumTopicRequest(
+                    peer=destination,
+                    title=getattr(topic, "title", "Topic"),
+                    icon_color=getattr(topic, "icon_color", None),
+                    icon_emoji_id=getattr(topic, "icon_emoji_id", None),
+                )
+            )
+            destination_topic_id = None
+            for update in getattr(created, "updates", []):
+                created_message = getattr(update, "message", None)
+                if created_message and getattr(created_message, "id", None):
+                    destination_topic_id = int(created_message.id)
+                    break
+            if destination_topic_id is None:
+                raise TelegramGatewayError(f"Unable to map forum topic: {getattr(topic, 'title', source_topic_id)}")
+            self.database.save_forum_topic(
+                project.id,
+                source_topic_id,
+                destination_topic_id,
+                getattr(topic, "title", None),
+            )
+
     @staticmethod
     def _within_date_range(project: Project, message: Message) -> bool:
         date = getattr(message, "date", None)
@@ -199,15 +250,18 @@ class BackupWorker:
             await self._process_message(project, client, destination, message, progress)
 
     async def _process_message(self, project: Project, client, destination, message: Message, progress: ScanProgress) -> None:
-        media_type = self._eligible_media(project, message)
-        if media_type is None:
+        content_type = self._eligible_media(project, message)
+        if content_type is None:
             return
         progress.eligible += 1
         source_id = int(project.source_chat_id or 0)
         if project.settings.skip_duplicates and self.database.transfer_completed(project.id, source_id, int(message.id)):
             progress.skipped += 1
             return
-        await self._transfer_with_retry(project, client, destination, message, media_type, progress)
+        if content_type in {MediaType.TEXT, MediaType.LINK}:
+            await self._send_text_with_retry(project, client, destination, message, content_type, progress)
+            return
+        await self._transfer_with_retry(project, client, destination, message, content_type, progress)
 
     async def _process_album(self, project: Project, client, destination, messages: list[Message], progress: ScanProgress) -> None:
         selected: list[tuple[Message, MediaType]] = []
@@ -270,6 +324,7 @@ class BackupWorker:
                     caption=captions,
                     parse_mode=None,
                     allow_cache=False,
+                    reply_to=self._destination_reply_target(project, group[0][0]),
                 )
                 sent_messages = sent if isinstance(sent, list) else [sent]
                 if len(sent_messages) != len(group):
@@ -394,6 +449,83 @@ class BackupWorker:
             finally:
                 self._delete_downloads(files)
 
+    async def _send_text_with_retry(
+        self,
+        project: Project,
+        client,
+        destination,
+        message: Message,
+        content_type: MediaType,
+        progress: ScanProgress,
+    ) -> None:
+        source_chat_id = int(project.source_chat_id)
+        text = self._message_links(message) if content_type == MediaType.LINK else (message.message or "")
+        if not text.strip():
+            return
+        progress.current_file = truncate(text, 60)
+        progress.phase = "💬 Sending fresh text/link"
+        for attempt in range(self.settings.max_upload_retries):
+            try:
+                self.database.begin_transfer(
+                    project_id=project.id,
+                    source_chat_id=source_chat_id,
+                    source_message_id=int(message.id),
+                    media_type=content_type.value,
+                    file_name="links.txt" if content_type == MediaType.LINK else "message.txt",
+                    file_size=len(text.encode("utf-8")),
+                    status=TransferStatus.UPLOADING,
+                )
+                sent = await client.send_message(
+                    destination,
+                    text,
+                    parse_mode=None,
+                    link_preview=content_type != MediaType.LINK,
+                    reply_to=self._destination_reply_target(project, message),
+                )
+                self.database.complete_transfer(
+                    project_id=project.id,
+                    source_chat_id=source_chat_id,
+                    source_message_id=int(message.id),
+                    destination_chat_id=int(project.destination_chat_id),
+                    destination_message_id=int(sent.id),
+                    checksum_sha256=None,
+                )
+                return
+            except errors.FloodWaitError as exc:
+                if await self._wait_flood(project, progress, exc.seconds):
+                    self.database.mark_transfer(project.id, source_chat_id, int(message.id), TransferStatus.RETRY_WAIT, "Interrupted during FloodWait")
+                    return
+            except Exception as exc:
+                if attempt + 1 >= self.settings.max_upload_retries:
+                    self.database.mark_transfer(project.id, source_chat_id, int(message.id), TransferStatus.FAILED, self._error_text(exc))
+                    progress.failed_this_run += 1
+                    return
+                await asyncio.sleep(min(2 ** (attempt + 1), 20))
+
+    def _destination_reply_target(self, project: Project, message: Message) -> int | None:
+        reply = getattr(message, "reply_to", None)
+        if not reply:
+            return None
+        parent_source_id = getattr(reply, "reply_to_msg_id", None)
+        if parent_source_id:
+            copied_parent = self.database.destination_message_id(project.id, int(project.source_chat_id), int(parent_source_id))
+            if copied_parent:
+                return copied_parent
+        source_topic_id = getattr(reply, "reply_to_top_id", None)
+        if source_topic_id:
+            return self.database.destination_topic_id(project.id, int(source_topic_id))
+        return None
+
+    @staticmethod
+    def _message_links(message: Message) -> str:
+        text = message.message or ""
+        links = re.findall(r"(?:https?://|tg://|t\.me/)[^\s<>]+", text, flags=re.IGNORECASE)
+        for entity in getattr(message, "entities", None) or []:
+            url = getattr(entity, "url", None)
+            if url:
+                links.append(str(url))
+        return "\n".join(dict.fromkeys(links))
+
     async def _server_copy_with_retry(
         self,
         project: Project,
@@ -433,6 +565,7 @@ class BackupWorker:
                     caption=caption,
                     parse_mode=None,
                     allow_cache=False,
+                    reply_to=self._destination_reply_target(project, message),
                 )
                 self.database.complete_transfer(
                     project_id=project.id,
@@ -497,6 +630,7 @@ class BackupWorker:
                     video_note=media_type == MediaType.VIDEO_NOTE,
                     allow_cache=False,
                     parse_mode=None,
+                    reply_to=self._destination_reply_target(project, message),
                 )
                 checksum = sha256_file(item.path) if project.settings.checksum_enabled else None
                 self.database.complete_transfer(
@@ -585,25 +719,37 @@ class BackupWorker:
 
     @staticmethod
     def _eligible_media(project: Project, message: Message) -> MediaType | None:
-        if not getattr(message, "media", None):
+        mode = project.settings.content_mode.upper()
+        links = BackupWorker._message_links(message)
+        if getattr(message, "media", None):
+            if getattr(message, "sticker", False):
+                media_type = MediaType.STICKER
+            elif getattr(message, "photo", None):
+                media_type = MediaType.PHOTO
+            elif getattr(message, "gif", False):
+                media_type = MediaType.GIF
+            elif getattr(message, "video_note", False):
+                media_type = MediaType.VIDEO_NOTE
+            elif getattr(message, "voice", False):
+                media_type = MediaType.VOICE
+            elif getattr(message, "video", False):
+                media_type = MediaType.VIDEO
+            elif getattr(message, "audio", False):
+                media_type = MediaType.AUDIO
+            elif getattr(message, "document", None):
+                media_type = MediaType.DOCUMENT
+            else:
+                media_type = MediaType.OTHER
+            if project.settings.allows(media_type):
+                return media_type
+            if links and project.settings.allows(MediaType.LINK):
+                return MediaType.LINK
             return None
-        if getattr(message, "sticker", False):
-            media_type = MediaType.STICKER
-        elif getattr(message, "photo", None):
-            media_type = MediaType.PHOTO
-        elif getattr(message, "video_note", False):
-            media_type = MediaType.VIDEO_NOTE
-        elif getattr(message, "voice", False):
-            media_type = MediaType.VOICE
-        elif getattr(message, "video", False):
-            media_type = MediaType.VIDEO
-        elif getattr(message, "audio", False):
-            media_type = MediaType.AUDIO
-        elif getattr(message, "document", None):
-            media_type = MediaType.DOCUMENT
-        else:
-            media_type = MediaType.OTHER
-        return media_type if project.settings.allows(media_type) else None
+        if mode == "EVERYTHING" and (message.message or ""):
+            return MediaType.TEXT
+        if links and project.settings.allows(MediaType.LINK):
+            return MediaType.LINK
+        return None
 
     async def _wait_flood(self, project: Project, progress: ScanProgress, seconds: int) -> bool:
         """Wait for Telegram's requested limit; return True when pause/stop interrupts it."""

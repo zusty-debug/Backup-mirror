@@ -73,3 +73,23 @@ def test_incomplete_transfers_are_retryable_after_restart() -> None:
     assert database.cleanup_incomplete_items() == 1
     assert database.retryable_source_message_ids(project.id) == [50]
     database.close()
+
+
+def test_forum_topic_and_admin_summaries() -> None:
+    database = make_database()
+    profile_id = database.ensure_profile(1001)
+    project = Project.draft(
+        owner_id=1001,
+        profile_id=profile_id,
+        name="Forum clone",
+        source_ref="source",
+        destination_ref="destination",
+    )
+    database.create_project(project)
+    database.save_forum_topic(project.id, 42, 142, "Movies")
+    assert database.destination_topic_id(project.id, 42) == 142
+    assert database.forum_topic_count(project.id) == 1
+    summary = database.global_admin_summary()
+    assert summary["users"] == 1
+    assert summary["projects"] == 1
+    database.close()

@@ -184,7 +184,13 @@ class TelegramGateway:
             raise TelegramGatewayError("A source/destination reference is required.")
         try:
             if reference.lstrip("-").isdigit():
-                return await client.get_entity(int(reference))
+                try:
+                    return await client.get_entity(int(reference))
+                except ValueError:
+                    # StringSession does not persist the entity cache. Refresh dialogs
+                    # before resolving a numeric private chat/channel ID.
+                    await client.get_dialogs()
+                    return await client.get_entity(int(reference))
             private_match = PRIVATE_CHANNEL_LINK.fullmatch(reference)
             if private_match:
                 return await client.get_entity(int(f"-100{private_match.group(1)}"))

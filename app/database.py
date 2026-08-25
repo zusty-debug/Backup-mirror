@@ -133,6 +133,16 @@ class Database:
                     event TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS forum_topics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    source_topic_id INTEGER NOT NULL,
+                    destination_topic_id INTEGER NOT NULL,
+                    title TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(project_id, source_topic_id)
+                );
                 """
             )
             self.connection.commit()
@@ -568,3 +578,94 @@ class Database:
                 (owner_id,),
             ).fetchall()
         return [str(row["last_error"]) for row in rows]
+
+    def destination_message_id(self, project_id: str, source_chat_id: int, source_message_id: int) -> int | None:
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT destination_message_id FROM transfer_items
+                WHERE project_id = ? AND source_chat_id = ? AND source_message_id = ? AND status = ?
+                """,
+                (project_id, source_chat_id, source_message_id, TransferStatus.COMPLETED.value),
+            ).fetchone()
+        return int(row["destination_message_id"]) if row and row["destination_message_id"] else None
+
+    def save_forum_topic(
+        self, project_id: str, source_topic_id: int, destination_topic_id: int, title: str | None = None
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO forum_topics(project_id, source_topic_id, destination_topic_id, title, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, source_topic_id) DO UPDATE SET
+                  destination_topic_id = excluded.destination_topic_id,
+                  title = excluded.title
+                """,
+                (project_id, source_topic_id, destination_topic_id, title, utcnow()),
+            )
+
+    def destination_topic_id(self, project_id: str, source_topic_id: int) -> int | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT destination_topic_id FROM forum_topics WHERE project_id = ? AND source_topic_id = ?",
+                (project_id, source_topic_id),
+            ).fetchone()
+        return int(row["destination_topic_id"]) if row else None
+
+    def forum_topic_count(self, project_id: str) -> int:
+        with self._lock:
+            return int(
+                self.connection.execute("SELECT COUNT(*) FROM forum_topics WHERE project_id = ?", (project_id,)).fetchone()[0]
+            )
+
+    def global_admin_summary(self) -> dict[str, int]:
+        with self._lock:
+            project_total = int(self.connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0])
+            user_total = int(self.connection.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+            worker_total = int(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM telegram_profiles WHERE session_encrypted IS NOT NULL"
+                ).fetchone()[0]
+            )
+            running_total = int(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM projects WHERE status IN (?, ?)",
+                    (ProjectStatus.RUNNING.value, ProjectStatus.WAITING_RATE_LIMIT.value),
+                ).fetchone()[0]
+            )
+        return {
+            "users": user_total,
+            "worker_sessions": worker_total,
+            "projects": project_total,
+            "running": running_total,
+        }
+
+    def admin_worker_profiles(self, limit: int = 50) -> list[sqlite3.Row]:
+        with self._lock:
+            return self.connection.execute(
+                """
+                SELECT owner_id, phone_hint, created_at, updated_at
+                FROM telegram_profiles
+                WHERE session_encrypted IS NOT NULL
+                ORDER BY updated_at DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+    def admin_active_projects(self, limit: int = 50) -> list[sqlite3.Row]:
+        with self._lock:
+            return self.connection.execute(
+                """
+                SELECT owner_id, name, status, source_name, destination_name, updated_at
+                FROM projects
+                WHERE status IN (?, ?, ?)
+                ORDER BY updated_at DESC LIMIT ?
+                """,
+                (
+                    ProjectStatus.RUNNING.value,
+                    ProjectStatus.WAITING_RATE_LIMIT.value,
+                    ProjectStatus.PAUSE_REQUESTED.value,
+                    limit,
+                ),
+            ).fetchall()
