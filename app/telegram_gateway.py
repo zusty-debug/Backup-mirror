@@ -34,6 +34,7 @@ class LoginChallenge:
     phone: str
     phone_code_hash: str
     expires_at: datetime
+    client: TelegramClient
     requires_password: bool = False
 
 
@@ -62,24 +63,33 @@ class TelegramGateway:
         if not re.fullmatch(r"\+?\d{7,15}", normalized):
             raise TelegramGatewayError("Enter a valid phone number in international format, e.g. +15551234567.")
         profile_id = self.database.ensure_profile(owner_id)
+        previous = self._challenges.pop(owner_id, None)
+        if previous:
+            await previous.client.disconnect()
         client = self._new_client()
         try:
             await client.connect()
             sent = await client.send_code_request(normalized)
             async with self._challenge_lock:
+                # Keep this exact MTProto connection open until code/password
+                # completion. This avoids invalidating an active login challenge.
                 self._challenges[owner_id] = LoginChallenge(
                     owner_id=owner_id,
                     profile_id=profile_id,
                     phone=normalized,
                     phone_code_hash=sent.phone_code_hash,
                     expires_at=datetime.now(UTC) + timedelta(minutes=10),
+                    client=client,
                 )
         except errors.PhoneNumberInvalidError as exc:
+            await client.disconnect()
             raise TelegramGatewayError("Telegram rejected that phone number.") from exc
         except errors.FloodWaitError as exc:
-            raise TelegramGatewayError(f"Telegram asked to wait {exc.seconds} seconds before requesting another code.") from exc
-        finally:
             await client.disconnect()
+            raise TelegramGatewayError(f"Telegram asked to wait {exc.seconds} seconds before requesting another code.") from exc
+        except Exception:
+            await client.disconnect()
+            raise
         return self.mask_phone(normalized)
 
     async def finish_login_code(self, owner_id: int, code: str) -> bool:
@@ -89,9 +99,8 @@ class TelegramGateway:
         clean_code = re.sub(r"\D", "", code)
         if not 4 <= len(clean_code) <= 8:
             raise TelegramGatewayError("Enter the numeric Telegram login code.")
-        client = self._new_client()
+        client = challenge.client
         try:
-            await client.connect()
             await client.sign_in(challenge.phone, clean_code, phone_code_hash=challenge.phone_code_hash)
         except errors.SessionPasswordNeededError:
             challenge.requires_password = True
@@ -100,15 +109,15 @@ class TelegramGateway:
             raise TelegramGatewayError("The login code is invalid.") from exc
         except errors.PhoneCodeExpiredError as exc:
             self._challenges.pop(owner_id, None)
-            raise TelegramGatewayError("The login code expired. Start connection again.") from exc
+            await client.disconnect()
+            raise TelegramGatewayError("Telegram expired this code. Start connection again for a new code.") from exc
         except errors.FloodWaitError as exc:
             raise TelegramGatewayError(f"Telegram asked to wait {exc.seconds} seconds before trying again.") from exc
         else:
             await self._store_connected_session(challenge.profile_id, challenge.phone, client)
             self._challenges.pop(owner_id, None)
-            return True
-        finally:
             await client.disconnect()
+            return True
 
     async def finish_login_password(self, owner_id: int, password: str) -> None:
         challenge = self._get_challenge(owner_id)
@@ -116,17 +125,14 @@ class TelegramGateway:
             raise TelegramGatewayError("Enter the Telegram login code first.")
         if not password:
             raise TelegramGatewayError("Two-step-verification password cannot be empty.")
-        client = self._new_client()
+        client = challenge.client
         try:
-            await client.connect()
-            # Telegram permits signing in with the stored phone-code hash after a password challenge.
-            await client.sign_in(challenge.phone, password=password, phone_code_hash=challenge.phone_code_hash)
+            await client.sign_in(password=password)
             await self._store_connected_session(challenge.profile_id, challenge.phone, client)
             self._challenges.pop(owner_id, None)
+            await client.disconnect()
         except errors.PasswordHashInvalidError as exc:
             raise TelegramGatewayError("The two-step-verification password is invalid.") from exc
-        finally:
-            await client.disconnect()
 
     def _get_challenge(self, owner_id: int) -> LoginChallenge:
         challenge = self._challenges.get(owner_id)
