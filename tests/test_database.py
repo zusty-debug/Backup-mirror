@@ -100,6 +100,11 @@ def test_forum_topic_and_admin_summaries() -> None:
     assert plan["scanned_total"] == 120
     assert plan["selected_total"] == 85
     assert plan["breakdown"]["DOCUMENT"] == 80
+    database.save_worker_pacing(profile_id, 60, 25, 120)
+    pacing = database.worker_pacing(profile_id, 40)
+    assert pacing["sends_per_minute"] == 60
+    assert pacing["successful_messages_since_adjustment"] == 25
+    assert pacing["last_flood_wait_seconds"] == 120
     summary = database.global_admin_summary()
     assert summary["users"] == 1
     assert summary["projects"] == 1

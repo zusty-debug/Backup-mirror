@@ -36,6 +36,10 @@ class ScanProgress:
     rate_wait_total: int | None = None
     rate_wait_remaining: int | None = None
     last_send_at: float = 0.0
+    current_pace: int = 40
+    sent_in_current_pace: int = 0
+    sent_before_cooldown: int | None = None
+    successful_messages_since_adjustment: int = 0
     started_at: float = field(default_factory=time.monotonic)
 
 
@@ -74,6 +78,9 @@ class BackupWorker:
                 project = self._reload(project.id)
             self.database.update_project_status(project.id, ProjectStatus.RUNNING)
             progress.completed_at_start = self.database.counters(project.id).completed
+            pacing = self.database.worker_pacing(project.profile_id, self.settings.initial_sends_per_minute)
+            progress.current_pace = min(int(pacing["sends_per_minute"]), self.settings.max_sends_per_minute)
+            progress.successful_messages_since_adjustment = int(pacing["successful_messages_since_adjustment"])
             plan = self.database.project_plan(project.id)
             if plan:
                 progress.total_eligible = int(plan["selected_total"])
@@ -527,6 +534,7 @@ class BackupWorker:
                         checksum_sha256=None,
                     )
                     progress.bytes_this_run += int(getattr(getattr(message, "file", None), "size", 0) or 0)
+                self._record_successful_sends(project, progress, len(group))
                 return
             except errors.FloodWaitError as exc:
                 if await self._wait_flood(project, progress, exc.seconds):
@@ -593,6 +601,7 @@ class BackupWorker:
                         checksum_sha256=checksum,
                     )
                     progress.bytes_this_run += item.size
+                self._record_successful_sends(project, progress, len(files))
                 return
             except errors.FloodWaitError as exc:
                 if await self._wait_flood(project, progress, exc.seconds):
@@ -680,6 +689,7 @@ class BackupWorker:
                     destination_message_id=int(sent.id),
                     checksum_sha256=None,
                 )
+                self._record_successful_sends(project, progress)
                 return
             except errors.FloodWaitError as exc:
                 if await self._wait_flood(project, progress, exc.seconds):
@@ -725,13 +735,37 @@ class BackupWorker:
         return "\n".join(dict.fromkeys(links))
 
     async def _pace_before_send(self, progress: ScanProgress, units: int = 1) -> None:
-        """Maintain a conservative per-message delivery pace for public workers."""
-        interval = 60 / self.settings.max_sends_per_minute
+        """Maintain the adaptive per-message delivery pace for this worker."""
+        interval = 60 / max(1, progress.current_pace)
         target = progress.last_send_at + interval * max(1, units)
         delay = target - time.monotonic()
         if delay > 0:
             await asyncio.sleep(delay)
         progress.last_send_at = time.monotonic()
+
+    def _record_successful_sends(self, project: Project, progress: ScanProgress, count: int = 1) -> None:
+        progress.sent_in_current_pace += count
+        progress.successful_messages_since_adjustment += count
+        pace_steps = (40, 50, 60, 80, 100)
+        if (
+            progress.successful_messages_since_adjustment >= self.settings.pace_upgrade_after_messages
+            and progress.current_pace < self.settings.max_sends_per_minute
+        ):
+            next_rate = next((rate for rate in pace_steps if rate > progress.current_pace), self.settings.max_sends_per_minute)
+            progress.current_pace = min(next_rate, self.settings.max_sends_per_minute)
+            progress.successful_messages_since_adjustment = 0
+            self.database.log_event(project.id, "INFO", f"Adaptive pace increased to {progress.current_pace}/minute")
+        self.database.save_worker_pacing(
+            project.profile_id,
+            progress.current_pace,
+            progress.successful_messages_since_adjustment,
+        )
+
+    @staticmethod
+    def _reduced_pace(rate: int) -> int:
+        steps = (40, 50, 60, 80, 100)
+        lower = [step for step in steps if step < rate]
+        return lower[-1] if lower else 40
 
     async def _server_copy_with_retry(
         self,
@@ -784,6 +818,7 @@ class BackupWorker:
                     checksum_sha256=None,
                 )
                 progress.bytes_this_run += size
+                self._record_successful_sends(project, progress)
                 return
             except errors.FloodWaitError as exc:
                 if await self._wait_flood(project, progress, exc.seconds):
@@ -851,6 +886,7 @@ class BackupWorker:
                     checksum_sha256=checksum,
                 )
                 progress.bytes_this_run += item.size
+                self._record_successful_sends(project, progress)
                 return
             except errors.FloodWaitError as exc:
                 if await self._wait_flood(project, progress, exc.seconds):
@@ -964,6 +1000,10 @@ class BackupWorker:
         """Respect Telegram pacing; return True when pause/stop interrupts it."""
         seconds = max(1, int(seconds))
         self.database.update_project_status(project.id, ProjectStatus.WAITING_RATE_LIMIT)
+        progress.sent_before_cooldown = progress.sent_in_current_pace
+        progress.current_pace = self._reduced_pace(progress.current_pace)
+        progress.successful_messages_since_adjustment = 0
+        self.database.save_worker_pacing(project.profile_id, progress.current_pace, 0, seconds)
         progress.phase = "🛡️ Telegram pace protection"
         progress.rate_wait_total = seconds
         progress.rate_wait_remaining = seconds
@@ -987,6 +1027,7 @@ class BackupWorker:
         self.database.update_project_status(project.id, ProjectStatus.RUNNING)
         progress.rate_wait_total = None
         progress.rate_wait_remaining = None
+        progress.sent_in_current_pace = 0
         progress.phase = "⚡ Sending fresh Telegram media"
         return False
 
@@ -1059,6 +1100,8 @@ class BackupWorker:
         elif progress.phase.startswith("🧮"):
             eta_line = f"🧮 Count scan: {progress.counted_messages:,} source messages checked"
         rate_bar_line = ""
+        pace_window_sent = progress.sent_before_cooldown if progress.rate_wait_remaining is not None else progress.sent_in_current_pace
+        pace_window_label = "Sent before this cooldown" if progress.rate_wait_remaining is not None else "Sent in current pace window"
         if progress.rate_wait_total is not None and progress.rate_wait_remaining is not None:
             wait_elapsed_pct = 100 * (progress.rate_wait_total - progress.rate_wait_remaining) / max(1, progress.rate_wait_total)
             rate_bar_line = (
@@ -1073,6 +1116,8 @@ class BackupWorker:
             f"📊 Progress: {progress_line}\n"
             f"{progress_bar + chr(10) if progress_bar else ''}"
             f"{rate_bar_line}"
+            f"🚀 Adaptive pace: {progress.current_pace}/minute\n"
+            f"📦 {pace_window_label}: {pace_window_sent or 0:,}\n"
             f"🔎 Source messages scanned this pass: {progress.scanned:,}\n"
             f"🎞️ Valid selected items found this pass: {progress.eligible:,}\n"
             f"✅ Sent this pass: {sent_this_run:,}\n"

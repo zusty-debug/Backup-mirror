@@ -372,6 +372,18 @@ If a project has not been scanned, pressing Start prompts the user to scan first
 - During a FloodWait, two separate bars are shown: overall approved-message progress and a countdown bar for Telegram's pacing window.
 - Every live backup card retains a `🔄 Refresh Live Status` button for an immediate snapshot, while automatic updates continue every two seconds.
 
+### Adaptive per-worker pace control
+
+Worker pacing is persisted in `worker_pacing` by worker profile. The adaptive schedule is:
+
+```text
+40/minute → 50/minute → 60/minute → 80/minute → 100/minute maximum
+```
+
+After each configured successful-send window, the worker moves to the next pace step. When Telegram returns FloodWait, the worker immediately moves one pace step down, persists the safer rate for that worker account, and resets the successful-send window.
+
+Live status reports the active rate plus `Sent in current pace window`. During a cooldown it reports `Sent before this cooldown`, so the user can see how much activity preceded Telegram's pacing window.
+
 ### Clear sent-versus-pending accounting
 
 Live status now separates the count users care about:

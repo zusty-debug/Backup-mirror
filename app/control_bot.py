@@ -932,6 +932,11 @@ class TelegramControlBot:
             wait_pct = 100 * (progress.rate_wait_total - progress.rate_wait_remaining) / max(1, progress.rate_wait_total)
             wait_bar = "▰" * round(10 * wait_pct / 100) + "▱" * (10 - round(10 * wait_pct / 100))
             rate_line = f"\n🛡️ Pace timer: {wait_bar} {wait_pct:.1f}%\n⏳ Resumes in: {progress.rate_wait_remaining}s"
+        pace_line = ""
+        if progress:
+            pace_window_sent = progress.sent_before_cooldown if progress.rate_wait_remaining is not None else progress.sent_in_current_pace
+            label = "Sent before this cooldown" if progress.rate_wait_remaining is not None else "Sent in current pace window"
+            pace_line = f"🚀 Adaptive pace: {progress.current_pace}/minute\n📦 {label}: {pace_window_sent or 0:,}\n"
         state = "🛡️ Telegram pace protection" if project.status == ProjectStatus.WAITING_RATE_LIMIT else project.status.value
         text = (
             "<b>📡 Live backup status</b>\n"
@@ -939,6 +944,7 @@ class TelegramControlBot:
             f"🔄 State: <code>{state}</code>\n"
             f"📍 Phase: {self._esc(phase)}\n\n"
             f"{progress_line}{rate_line}\n"
+            f"{pace_line}"
             f"✅ Sent this pass: {sent_this_run:,}\n"
             f"🟡 Pending/retrying this pass: {pending_this_pass:,}\n"
             f"♻️ Already copied: {progress.skipped if progress else 0:,}\n"

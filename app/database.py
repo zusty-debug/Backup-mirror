@@ -162,6 +162,14 @@ class Database:
                     breakdown_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS worker_pacing (
+                    profile_id INTEGER PRIMARY KEY REFERENCES telegram_profiles(id) ON DELETE CASCADE,
+                    sends_per_minute INTEGER NOT NULL,
+                    successful_messages_since_adjustment INTEGER NOT NULL DEFAULT 0,
+                    last_flood_wait_seconds INTEGER,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             self.connection.commit()
@@ -778,3 +786,53 @@ class Database:
     def clear_project_plan(self, project_id: str) -> None:
         with self.transaction() as conn:
             conn.execute("DELETE FROM project_plans WHERE project_id = ?", (project_id,))
+
+    def worker_pacing(self, profile_id: int, default_rate: int) -> dict[str, int | None]:
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT sends_per_minute, successful_messages_since_adjustment, last_flood_wait_seconds
+                FROM worker_pacing WHERE profile_id = ?
+                """,
+                (profile_id,),
+            ).fetchone()
+        if not row:
+            return {
+                "sends_per_minute": default_rate,
+                "successful_messages_since_adjustment": 0,
+                "last_flood_wait_seconds": None,
+            }
+        return {
+            "sends_per_minute": int(row["sends_per_minute"]),
+            "successful_messages_since_adjustment": int(row["successful_messages_since_adjustment"]),
+            "last_flood_wait_seconds": row["last_flood_wait_seconds"],
+        }
+
+    def save_worker_pacing(
+        self,
+        profile_id: int,
+        sends_per_minute: int,
+        successful_messages_since_adjustment: int,
+        last_flood_wait_seconds: int | None = None,
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO worker_pacing(
+                    profile_id, sends_per_minute, successful_messages_since_adjustment,
+                    last_flood_wait_seconds, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(profile_id) DO UPDATE SET
+                    sends_per_minute = excluded.sends_per_minute,
+                    successful_messages_since_adjustment = excluded.successful_messages_since_adjustment,
+                    last_flood_wait_seconds = excluded.last_flood_wait_seconds,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    profile_id,
+                    sends_per_minute,
+                    successful_messages_since_adjustment,
+                    last_flood_wait_seconds,
+                    utcnow(),
+                ),
+            )
