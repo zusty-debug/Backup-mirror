@@ -283,12 +283,13 @@ class Database:
 
     def projects_to_resume(self) -> list[Project]:
         statuses = (
+            ProjectStatus.QUEUED.value,
             ProjectStatus.RUNNING.value,
             ProjectStatus.WAITING_RATE_LIMIT.value,
         )
         with self._lock:
             rows = self.connection.execute(
-                "SELECT * FROM projects WHERE status IN (?, ?)", statuses
+                "SELECT * FROM projects WHERE status IN (?, ?, ?)", statuses
             ).fetchall()
         return [self._project_from_row(row) for row in rows]
 
@@ -668,4 +669,14 @@ class Database:
                     ProjectStatus.PAUSE_REQUESTED.value,
                     limit,
                 ),
+            ).fetchall()
+
+    def recent_events(self, project_id: str, limit: int = 30) -> list[sqlite3.Row]:
+        with self._lock:
+            return self.connection.execute(
+                """
+                SELECT level, event, created_at FROM project_events
+                WHERE project_id = ? ORDER BY id DESC LIMIT ?
+                """,
+                (project_id, limit),
             ).fetchall()

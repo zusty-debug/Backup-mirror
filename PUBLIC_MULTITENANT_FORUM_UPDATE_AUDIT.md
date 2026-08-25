@@ -315,3 +315,48 @@ Content selection is now multi-select instead of a single fixed choice.
 8. Test a text reply whose parent is also selected in Everything mode.
 9. Enable sync, exhaust source content, wait 300 seconds, and confirm final scan then completion.
 10. Trigger/rate-limit test only with normal Telegram behavior; confirm FloodWait state and safe resume.
+
+## 19. Product intelligence additions beyond the requested flows
+
+The public version now adds operational capabilities chosen to make the service usable under a shared runtime rather than merely adding more menu buttons.
+
+### Fair public-job scheduler
+
+- Global concurrent backup limit: `MAX_CONCURRENT_BACKUPS` (default `2`).
+- Per-user active-job limit: `MAX_ACTIVE_PROJECTS_PER_USER` (default `1`).
+- Overflow jobs move to a durable `QUEUED` status instead of starting an unlimited number of Telegram clients at once.
+- When a job exits, the scheduler promotes queued jobs fairly while respecting per-user limits.
+- Queue events are recorded in project activity.
+
+This protects public users from each other and reduces avoidable Telegram rate-limit pressure.
+
+### Accurate progress and ETA
+
+For one-time/history runs, the worker performs a read-only selected-content count before transfer. Live status can then show:
+
+- exact selected-item total;
+- percentage complete;
+- item-rate-derived ETA;
+- counting-scan progress before transfers begin.
+
+### Read-only Preview Scan
+
+Every project has `🔍 Preview Scan`.
+
+It scans without sending any message and returns:
+
+- source messages inspected;
+- total selected items;
+- content-type breakdown;
+- no-copy confirmation.
+
+This is useful for validating a source, content choices, forum-topic selection, and expected workload before consuming Telegram delivery capacity.
+
+### Operational controls
+
+Every project now has:
+
+- `🧪 Verify Access` — re-checks source readability and destination send access;
+- `📜 Activity` — timestamped run, queue, count, rate-limit, error, and completion events;
+- `🔁 Retry Failed` — safely resumes retryable failed items;
+- `➕ Duplicate Setup` — creates a ready-to-edit copy of an existing project configuration.

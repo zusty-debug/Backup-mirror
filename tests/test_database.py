@@ -93,3 +93,42 @@ def test_forum_topic_and_admin_summaries() -> None:
     assert summary["users"] == 1
     assert summary["projects"] == 1
     database.close()
+
+
+async def test_fair_scheduler_queues_second_project_for_same_user() -> None:
+    from types import SimpleNamespace
+
+    from app.worker import WorkerManager
+
+    database = make_database()
+    profile_id = database.ensure_profile(1001)
+    first = Project.draft(owner_id=1001, profile_id=profile_id, name="First", source_ref="a", destination_ref="b")
+    second = Project.draft(owner_id=1001, profile_id=profile_id, name="Second", source_ref="c", destination_ref="d")
+    database.create_project(first)
+    database.create_project(second)
+
+    first_release = __import__("asyncio").Event()
+    second_release = __import__("asyncio").Event()
+
+    class FakeWorker:
+        settings = SimpleNamespace(max_concurrent_backups=2, max_active_projects_per_user=1)
+
+        async def run(self, project_id: str) -> None:
+            if project_id == first.id:
+                await first_release.wait()
+            else:
+                await second_release.wait()
+
+    manager = WorkerManager(FakeWorker(), database)
+    assert await manager.start(first.id) == "STARTED"
+    assert await manager.start(second.id) == "QUEUED"
+    assert database.get_project(second.id).status == ProjectStatus.QUEUED
+    assert manager.queue_position(second.id) == 1
+
+    first_release.set()
+    await __import__("asyncio").sleep(0)
+    await __import__("asyncio").sleep(0)
+    assert manager.is_running(second.id)
+    second_release.set()
+    await manager.shutdown()
+    database.close()

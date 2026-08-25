@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     status_update_seconds: int = Field(default=8, alias="STATUS_UPDATE_SECONDS", ge=5, le=60)
     sync_poll_seconds: int = Field(default=300, alias="SYNC_POLL_SECONDS", ge=60, le=86400)
     max_projects_per_owner: int = Field(default=20, alias="MAX_PROJECTS_PER_OWNER", ge=1, le=100)
+    max_concurrent_backups: int = Field(default=2, alias="MAX_CONCURRENT_BACKUPS", ge=1, le=20)
+    max_active_projects_per_user: int = Field(default=1, alias="MAX_ACTIVE_PROJECTS_PER_USER", ge=1, le=10)
     max_upload_retries: int = Field(default=4, alias="MAX_UPLOAD_RETRIES", ge=1, le=10)
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 

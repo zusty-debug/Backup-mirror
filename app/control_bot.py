@@ -177,7 +177,8 @@ class TelegramControlBot:
         project = self.database.get_project(project_id, user_id) if project_id else None
         project_actions = {
             "confirm", "cancel", "view", "start", "pause", "stopask", "stop", "status",
-            "settings", "caption", "sync", "report", "failed", "deleteask", "delete",
+            "settings", "caption", "sync", "report", "failed", "activity", "verify", "preview", "retry",
+            "duplicate", "deleteask", "delete",
         }
         if action in project_actions and not project:
             await event.answer("Project not found", alert=True)
@@ -204,8 +205,14 @@ class TelegramControlBot:
                 parse_mode="html",
             )
             self.database.set_status_message(project.id, int(event.chat_id), int(status.id))
-            started = await self.workers.start(project.id)
-            await event.answer("Backup started" if started else "Already running")
+            start_result = await self.workers.start(project.id)
+            if start_result == "QUEUED":
+                position = self.workers.queue_position(project.id)
+                await event.answer(f"Queued at position {position}")
+            elif start_result == "ALREADY_RUNNING":
+                await event.answer("Backup is already running")
+            else:
+                await event.answer("Backup started")
             await self._edit_project(event, self.database.get_project(project.id, user_id))
         elif action == "pause":
             if self.workers.is_running(project.id):
@@ -235,6 +242,82 @@ class TelegramControlBot:
         elif action == "status":
             await event.answer()
             await self._edit_project(event, project, show_counters=True)
+        elif action == "verify":
+            try:
+                source, destination = await self.gateway.preflight(project.profile_id, project.source_ref, project.destination_ref)
+                self.database.update_project_resolution(
+                    project.id,
+                    int(source.id),
+                    self.gateway.entity_name(source),
+                    int(destination.id),
+                    self.gateway.entity_name(destination),
+                )
+                self.database.log_event(project.id, "INFO", "Manual source/destination verification passed")
+                await event.answer("Source and destination verified")
+            except TelegramGatewayError as exc:
+                self.database.log_event(project.id, "ERROR", f"Manual verification failed: {exc}")
+                await event.answer(f"Verification failed: {truncate(str(exc), 90)}", alert=True)
+            await self._edit_project(event, self.database.get_project(project.id, user_id))
+        elif action == "preview":
+            await event.answer("Running read-only preview scan…")
+            try:
+                counts = await self.workers.worker.preview(project.id)
+                total = counts.pop("TOTAL", 0)
+                scanned = counts.pop("SCANNED", 0)
+                breakdown = "\n".join(f"• {self._esc(kind.title().replace('_', ' '))}: {amount:,}" for kind, amount in sorted(counts.items()))
+                text = (
+                    f"<b>🔍 Preview — {self._esc(project.name)}</b>\n\n"
+                    f"🔎 Source messages scanned: {scanned:,}\n"
+                    f"📦 Selected content: {total:,}\n\n"
+                    f"{breakdown or 'No selected content found.'}\n\n"
+                    "No messages were sent during this preview."
+                )
+                self.database.log_event(project.id, "INFO", f"Preview displayed: {total} selected items")
+                await self._edit_reply(event, text, buttons=[[Button.inline("⬅️ Project", f"view:{project.id}".encode())]])
+            except Exception as exc:
+                self.database.log_event(project.id, "ERROR", f"Preview failed: {exc}")
+                await event.answer(f"Preview failed: {truncate(str(exc), 90)}", alert=True)
+        elif action == "activity":
+            rows = self.database.recent_events(project.id)
+            lines = [f"<b>📜 Activity — {self._esc(project.name)}</b>", ""]
+            if not rows:
+                lines.append("No recorded events yet.")
+            else:
+                for row in rows:
+                    icon = {"INFO": "ℹ️", "WARNING": "⚠️", "ERROR": "❌"}.get(str(row["level"]), "•")
+                    lines.append(
+                        f"{icon} <code>{self._esc(str(row['created_at']))}</code>\n"
+                        f"   {self._esc(truncate(str(row['event']), 180))}"
+                    )
+            await event.answer()
+            await self._edit_reply(event, "\n".join(lines), buttons=[[Button.inline("⬅️ Project", f"view:{project.id}".encode())]])
+        elif action == "retry":
+            status = await self.workers.start(project.id)
+            await event.answer("Retry queued" if status == "QUEUED" else "Retry started")
+            await self._edit_project(event, self.database.get_project(project.id, user_id))
+        elif action == "duplicate":
+            clone = Project.draft(
+                owner_id=user_id,
+                profile_id=project.profile_id,
+                name=f"Copy of {project.name}"[:100],
+                source_ref=project.source_ref,
+                destination_ref=project.destination_ref,
+                scan_mode=project.scan_mode,
+                settings=project.settings,
+            )
+            clone.start_message_id = project.start_message_id
+            clone.start_date = project.start_date
+            clone.end_date = project.end_date
+            self.database.create_project(clone)
+            self.database.update_project_resolution(
+                clone.id,
+                int(project.source_chat_id),
+                project.source_name or project.source_ref,
+                int(project.destination_chat_id),
+                project.destination_name or project.destination_ref,
+            )
+            await event.answer("Project configuration duplicated")
+            await self._edit_project(event, self.database.get_project(clone.id, user_id))
         elif action == "settings":
             await event.answer()
             await self._edit_settings(event, project)
@@ -735,7 +818,10 @@ class TelegramControlBot:
         return [
             [Button.inline("▶️ Start / Resume", f"start:{project_id}".encode()), Button.inline("⏸️ Pause", f"pause:{project_id}".encode())],
             [Button.inline("⏹️ Stop", f"stopask:{project_id}".encode()), Button.inline("📡 Live Status", f"status:{project_id}".encode())],
+            [Button.inline("🧪 Verify Access", f"verify:{project_id}".encode()), Button.inline("🔍 Preview Scan", f"preview:{project_id}".encode())],
+            [Button.inline("📜 Activity", f"activity:{project_id}".encode())],
             [Button.inline("⚙️ Settings", f"settings:{project_id}".encode()), Button.inline("📄 Full Report", f"report:{project_id}".encode())],
+            [Button.inline("🔁 Retry Failed", f"retry:{project_id}".encode()), Button.inline("➕ Duplicate Setup", f"duplicate:{project_id}".encode())],
             [Button.inline("⚠️ Failed Files", f"failed:{project_id}".encode()), Button.inline("🗑️ Delete", f"deleteask:{project_id}".encode())],
             [Button.inline("📂 My Projects", b"project:list"), Button.inline("🛠️ Admin", b"admin")],
         ]
@@ -765,7 +851,7 @@ class TelegramControlBot:
 
     @staticmethod
     def _project_card(project: Project) -> str:
-        return (
+        base = (
             f"<b>📁 {TelegramControlBot._esc(project.name)}</b>\n"
             f"🔄 Status: <code>{project.status.value}</code>\n"
             f"📥 Source: {TelegramControlBot._esc(project.source_name or project.source_ref)}\n"
@@ -776,8 +862,10 @@ class TelegramControlBot:
             f"🧵 Forum topics: {'Clone enabled' if project.settings.clone_forum_topics else 'Normal chat'}\n"
             f"📝 Captions: {'On' if project.settings.preserve_captions else 'Off'} · "
             f"🔄 Sync: {'On' if project.settings.continuous_sync else 'Off'}"
-            + (f"\n\n❌ Last error: <code>{TelegramControlBot._esc(truncate(project.last_error, 260))}</code>" if project.last_error else "")
         )
+        scheduler = "\n⏳ Scheduler: waiting for a fair worker slot" if project.status == ProjectStatus.QUEUED else ""
+        error = f"\n\n❌ Last error: <code>{TelegramControlBot._esc(truncate(project.last_error, 260))}</code>" if project.last_error else ""
+        return base + scheduler + error
 
     @staticmethod
     def _help_text() -> str:

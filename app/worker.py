@@ -31,6 +31,7 @@ class ScanProgress:
     current_file: str = "Preparing…"
     phase: str = "🚀 Preparing"
     total_eligible: int | None = None
+    counted_messages: int = 0
     started_at: float = field(default_factory=time.monotonic)
 
 
@@ -66,6 +67,7 @@ class BackupWorker:
                 await self._preflight(project)
                 project = self._reload(project.id)
             self.database.update_project_status(project.id, ProjectStatus.RUNNING)
+            self.database.log_event(project.id, "INFO", "Backup run started")
             await self._status(project, progress, force=True)
 
             waited_for_idle_media = False
@@ -122,6 +124,7 @@ class BackupWorker:
                 counters.failed = max(counters.failed, progress.failed_this_run)
                 counters.bytes_transferred = max(counters.bytes_transferred, progress.bytes_this_run)
                 self.database.close_run(run_id, result, counters)
+                self.database.log_event(project_id, "INFO", f"Backup run finished: {result}")
                 await self._status(project, progress, force=True, final=True)
 
     async def _preflight(self, project: Project) -> None:
@@ -134,6 +137,27 @@ class BackupWorker:
             self.gateway.entity_name(destination),
         )
 
+    async def preview(self, project_id: str) -> dict[str, int]:
+        """Read-only estimate of selected source content before the user starts a run."""
+        project = self._reload(project_id)
+        counts: dict[str, int] = {}
+        scanned = 0
+        async with self.gateway.client_for_profile(project.profile_id) as client:
+            source = await self.gateway.resolve_entity(client, project.source_ref)
+            checkpoint = project.checkpoint_message_id or 0
+            min_id = max(checkpoint, (project.start_message_id or 1) - 1)
+            async for message in client.iter_messages(source, reverse=True, min_id=min_id):
+                if not self._within_date_range(project, message) or not self._message_in_selected_topic(project, message):
+                    continue
+                scanned += 1
+                kind = self._eligible_media(project, message)
+                if kind:
+                    counts[kind.value] = counts.get(kind.value, 0) + 1
+        counts["SCANNED"] = scanned
+        counts["TOTAL"] = sum(value for key, value in counts.items() if key != "SCANNED")
+        self.database.log_event(project.id, "INFO", f"Preview scan: {counts['TOTAL']} selected items found")
+        return counts
+
     async def _run_single_pass(self, project: Project, progress: ScanProgress) -> None:
         if project.source_chat_id is None or project.destination_chat_id is None:
             raise TelegramGatewayError("Project has not completed source/destination validation.")
@@ -142,6 +166,8 @@ class BackupWorker:
             source = await self.gateway.resolve_entity(client, project.source_ref)
             destination = await self.gateway.resolve_entity(client, project.destination_ref)
             await self._ensure_forum_topics(project, client, source, destination, progress)
+            if progress.total_eligible is None and not project.settings.continuous_sync:
+                await self._count_eligible_items(project, client, source, progress)
             # Retry items that were left failed/retryable before moving past the saved checkpoint.
             for message_id in self.database.retryable_source_message_ids(project.id):
                 message = await client.get_messages(source, ids=message_id)
@@ -258,6 +284,28 @@ class BackupWorker:
             if destination_topic_id is None:
                 raise TelegramGatewayError(f"Unable to map forum topic: {title}")
             self.database.save_forum_topic(project.id, source_topic_id, destination_topic_id, title)
+
+    async def _count_eligible_items(self, project: Project, client, source, progress: ScanProgress) -> None:
+        """Count selected source items once to provide real progress and ETA."""
+        checkpoint = project.checkpoint_message_id or 0
+        min_id = max(checkpoint, (project.start_message_id or 1) - 1)
+        progress.phase = "🧮 Counting selected content"
+        progress.current_file = "Calculating total for live progress"
+        total = 0
+        counted = 0
+        async for message in client.iter_messages(source, reverse=True, min_id=min_id):
+            if not self._within_date_range(project, message) or not self._message_in_selected_topic(project, message):
+                continue
+            counted += 1
+            if self._eligible_media(project, message) is not None:
+                total += 1
+            if counted % 250 == 0:
+                progress.counted_messages = counted
+                await self._status(project, progress)
+        progress.counted_messages = counted
+        progress.total_eligible = total
+        progress.phase = "🔎 Scanning source"
+        self.database.log_event(project.id, "INFO", f"Counted {total} selected source items for progress tracking")
 
     @staticmethod
     def _within_date_range(project: Project, message: Message) -> bool:
@@ -841,9 +889,15 @@ class BackupWorker:
         elapsed_text = self._readable_duration(elapsed)
         copied_or_skipped = counters.completed + progress.skipped
         progress_line = f"{copied_or_skipped:,} processed"
+        eta_line = "⏳ ETA: calculating…"
         if progress.total_eligible:
             percentage = min(100.0, copied_or_skipped * 100 / progress.total_eligible)
             progress_line = f"{copied_or_skipped:,} / {progress.total_eligible:,} ({percentage:.1f}%)"
+            item_rate = copied_or_skipped / elapsed
+            remaining = max(0, progress.total_eligible - copied_or_skipped)
+            eta_line = f"⏳ ETA: {self._readable_duration(remaining / item_rate)}" if item_rate > 0 else "⏳ ETA: calculating…"
+        elif progress.phase.startswith("🧮"):
+            eta_line = f"🧮 Count scan: {progress.counted_messages:,} source messages checked"
         text = (
             f"<b>{title}</b>\n"
             f"📁 Project: <b>{self._escape(project.name)}</b>\n"
@@ -857,6 +911,7 @@ class BackupWorker:
             f"⚠️ Failed: {max(counters.failed, progress.failed_this_run):,}\n"
             f"📦 Media reused: {readable_bytes(counters.bytes_transferred)}\n"
             f"⚡ Effective speed: {readable_bytes(speed)}/s\n"
+            f"{eta_line}\n"
             f"⏱️ Elapsed: {elapsed_text}\n"
             f"📌 Current: <code>{self._escape(truncate(progress.current_file, 70))}</code>\n\n"
             "<i>Developed by — @xzusty</i>"
@@ -905,37 +960,102 @@ class BackupWorker:
 
 
 class WorkerManager:
+    """Fair scheduler for the shared public-bot worker pool.
+
+    The application can serve many users while keeping a controlled number of
+    Telegram client jobs active. One user cannot occupy every active slot.
+    """
+
     def __init__(self, worker: BackupWorker, database: Database) -> None:
         self.worker = worker
         self.database = database
         self.tasks: dict[str, asyncio.Task[None]] = {}
+        self.queued_project_ids: list[str] = []
+        self._lock = asyncio.Lock()
 
     def is_running(self, project_id: str) -> bool:
         task = self.tasks.get(project_id)
         return bool(task and not task.done())
 
-    async def start(self, project_id: str) -> bool:
-        if self.is_running(project_id):
-            return False
-        project = self.database.get_project(project_id)
-        if project is None:
-            raise ValueError("Project does not exist")
-        if project.status in {ProjectStatus.COMPLETED, ProjectStatus.STOPPED, ProjectStatus.FAILED, ProjectStatus.PAUSED}:
-            self.database.update_project_status(project_id, ProjectStatus.READY)
+    def queue_position(self, project_id: str) -> int | None:
+        try:
+            return self.queued_project_ids.index(project_id) + 1
+        except ValueError:
+            return None
+
+    def _owner_active_count(self, owner_id: int) -> int:
+        active = 0
+        for running_project_id, task in self.tasks.items():
+            if task.done():
+                continue
+            project = self.database.get_project(running_project_id)
+            if project and project.owner_id == owner_id:
+                active += 1
+        return active
+
+    def _has_capacity(self, project: Project) -> bool:
+        active_total = sum(1 for task in self.tasks.values() if not task.done())
+        return (
+            active_total < self.worker.settings.max_concurrent_backups
+            and self._owner_active_count(project.owner_id) < self.worker.settings.max_active_projects_per_user
+        )
+
+    async def start(self, project_id: str) -> str:
+        """Start now or place the project into a durable fair queue."""
+        async with self._lock:
+            if self.is_running(project_id):
+                return "ALREADY_RUNNING"
+            project = self.database.get_project(project_id)
+            if project is None:
+                raise ValueError("Project does not exist")
+            if project.status in {ProjectStatus.COMPLETED, ProjectStatus.STOPPED, ProjectStatus.FAILED, ProjectStatus.PAUSED}:
+                self.database.update_project_status(project_id, ProjectStatus.READY)
+                project = self.database.get_project(project_id)
+            if not self._has_capacity(project):
+                if project_id not in self.queued_project_ids:
+                    self.queued_project_ids.append(project_id)
+                self.database.update_project_status(project_id, ProjectStatus.QUEUED)
+                self.database.log_event(project_id, "INFO", "Queued by fair scheduler")
+                return "QUEUED"
+            self._launch(project_id)
+            return "STARTED"
+
+    def _launch(self, project_id: str) -> None:
         task = asyncio.create_task(self._run_and_cleanup(project_id), name=f"backup-{project_id}")
         self.tasks[project_id] = task
-        return True
 
     async def _run_and_cleanup(self, project_id: str) -> None:
         try:
             await self.worker.run(project_id)
         finally:
             self.tasks.pop(project_id, None)
+            await self._drain_queue()
+
+    async def _drain_queue(self) -> None:
+        async with self._lock:
+            for project_id in list(self.queued_project_ids):
+                project = self.database.get_project(project_id)
+                if project is None or project.status != ProjectStatus.QUEUED:
+                    self.queued_project_ids.remove(project_id)
+                    continue
+                if not self._has_capacity(project):
+                    continue
+                self.queued_project_ids.remove(project_id)
+                self._launch(project_id)
+                # Continue to use any remaining global slots for other owners.
 
     def request_pause(self, project_id: str) -> None:
+        if project_id in self.queued_project_ids:
+            self.queued_project_ids.remove(project_id)
+            self.database.update_project_status(project_id, ProjectStatus.PAUSED)
+            return
         self.database.request_pause(project_id)
 
     def request_stop(self, project_id: str) -> None:
+        if project_id in self.queued_project_ids:
+            self.queued_project_ids.remove(project_id)
+            self.database.update_project_status(project_id, ProjectStatus.STOPPED)
+            return
         self.database.request_stop(project_id)
 
     async def resume_after_restart(self) -> None:

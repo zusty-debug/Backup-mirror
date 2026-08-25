@@ -15,6 +15,7 @@ def utcnow() -> str:
 class ProjectStatus(StrEnum):
     DRAFT = "DRAFT"
     READY = "READY"
+    QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     PAUSE_REQUESTED = "PAUSE_REQUESTED"
     PAUSED = "PAUSED"
