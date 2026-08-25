@@ -165,6 +165,9 @@ class BackupWorker:
         async with self.gateway.client_for_profile(project.profile_id) as client:
             source = await self.gateway.resolve_entity(client, project.source_ref)
             destination = await self.gateway.resolve_entity(client, project.destination_ref)
+            if getattr(source, "forum", False) and project.settings.forum_to_channel_segments:
+                await self._run_forum_to_channel_segments(project, client, source, destination, progress)
+                return
             await self._ensure_forum_topics(project, client, source, destination, progress)
             if progress.total_eligible is None and not project.settings.continuous_sync:
                 await self._count_eligible_items(project, client, source, progress)
@@ -243,47 +246,94 @@ class BackupWorker:
                 continue
             if self.database.destination_topic_id(project.id, source_topic_id):
                 continue
-            # Telegram's General topic exists automatically in every forum.
-            if source_topic_id == 1:
-                self.database.save_forum_topic(project.id, 1, 1, getattr(topic, "title", "General"))
-                continue
+            # Topic creation/matching is completed during the setup wizard.
+            # The worker never attempts a privileged topic-create operation mid-run.
             title = str(getattr(topic, "title", None) or "Topic")
-            created = await client(
-                functions.messages.CreateForumTopicRequest(
-                    peer=destination,
-                    title=title,
-                    # Telegram accepts a normal icon colour even if the source topic
-                    # has no custom icon metadata.
-                    icon_color=getattr(topic, "icon_color", None) or 0x6FB9F0,
-                    icon_emoji_id=getattr(topic, "icon_emoji_id", None),
-                )
+            raise TelegramGatewayError(
+                f"Destination topic mapping is missing for '{title}'. Recreate the project and complete forum setup first."
             )
-            destination_topic_id = None
-            for update in getattr(created, "updates", []):
-                created_message = getattr(update, "message", None)
-                if created_message and getattr(created_message, "id", None):
-                    destination_topic_id = int(created_message.id)
-                    break
-            if destination_topic_id is None:
-                # Some Telegram update forms omit the created message object. Refresh
-                # destination topics and match the newly created title as a fallback.
-                destination_topics = await client(
-                    functions.messages.GetForumTopicsRequest(
-                        peer=destination,
-                        offset_date=None,
-                        offset_id=0,
-                        offset_topic=0,
-                        limit=100,
-                        q=title,
-                    )
-                )
-                for destination_topic in getattr(destination_topics, "topics", []):
-                    if getattr(destination_topic, "title", None) == title:
-                        destination_topic_id = int(destination_topic.id)
-                        break
-            if destination_topic_id is None:
-                raise TelegramGatewayError(f"Unable to map forum topic: {title}")
-            self.database.save_forum_topic(project.id, source_topic_id, destination_topic_id, title)
+
+    async def _run_forum_to_channel_segments(self, project: Project, client, source, destination, progress: ScanProgress) -> None:
+        """Mirror selected forum topics into one normal channel, topic by topic."""
+        selected = [int(topic_id) for topic_id in project.settings.forum_topic_ids]
+        if not selected:
+            raise TelegramGatewayError("No forum topics were selected for channel segmentation.")
+        result = await client(
+            functions.messages.GetForumTopicsRequest(
+                peer=source,
+                offset_date=None,
+                offset_id=0,
+                offset_topic=0,
+                limit=100,
+                q=None,
+            )
+        )
+        topic_by_id = {int(topic.id): topic for topic in getattr(result, "topics", []) if getattr(topic, "id", None)}
+        for topic_id in selected:
+            topic = topic_by_id.get(topic_id)
+            if not topic:
+                self.database.log_event(project.id, "WARNING", f"Selected forum topic {topic_id} is unavailable; skipped")
+                continue
+            title = str(getattr(topic, "title", None) or f"Topic {topic_id}")
+            await self._ensure_forum_channel_header(project, client, destination, topic_id, title)
+            progress.phase = f"🧵 Mirroring topic: {title}"
+            progress.current_file = f"Topic header pinned: {title}"
+            self.database.log_event(project.id, "INFO", f"Started forum channel segment: {title}")
+            album: list[Message] = []
+            album_key: int | None = None
+            # Topic processing deliberately uses the ledger for resume protection
+            # instead of a shared cross-topic checkpoint.
+            async for message in client.iter_messages(source, reverse=True, min_id=0):
+                if not self._within_date_range(project, message):
+                    continue
+                if self._forum_message_topic_id(message) != topic_id:
+                    continue
+                progress.scanned += 1
+                grouped_id = getattr(message, "grouped_id", None)
+                if album and grouped_id != album_key:
+                    await self._process_batch(project, client, destination, album, progress)
+                    if await self._at_control_boundary(project.id, progress):
+                        return
+                    album = []
+                    album_key = None
+                if grouped_id:
+                    album.append(message)
+                    album_key = grouped_id
+                else:
+                    await self._process_message(project, client, destination, message, progress)
+                    if await self._at_control_boundary(project.id, progress):
+                        return
+                await self._status(project, progress)
+            if album:
+                await self._process_batch(project, client, destination, album, progress)
+                if await self._at_control_boundary(project.id, progress):
+                    return
+            self.database.log_event(project.id, "INFO", f"Finished forum channel segment: {title}")
+
+    async def _ensure_forum_channel_header(self, project: Project, client, destination, topic_id: int, title: str) -> int:
+        existing = self.database.forum_channel_segment(project.id, topic_id)
+        if existing:
+            return int(existing["destination_header_message_id"])
+        header = await client.send_message(
+            destination,
+            f"📌 <b>{self._escape(title)}</b>\n\n<i>Forum topic mirror begins below</i>",
+            parse_mode="html",
+            link_preview=False,
+        )
+        pinned = False
+        try:
+            await client.pin_message(destination, header, notify=False)
+            pinned = True
+        except errors.RPCError as exc:
+            self.database.log_event(project.id, "WARNING", f"Could not pin topic header '{title}': {self._error_text(exc)}")
+        self.database.save_forum_channel_segment(project.id, topic_id, int(header.id), title, pinned=pinned)
+        return int(header.id)
+
+    @staticmethod
+    def _forum_message_topic_id(message: Message) -> int:
+        reply = getattr(message, "reply_to", None)
+        top_id = getattr(reply, "reply_to_top_id", None) if reply else None
+        return int(top_id) if top_id else 1
 
     async def _count_eligible_items(self, project: Project, client, source, progress: ScanProgress) -> None:
         """Count selected source items once to provide real progress and ETA."""
@@ -583,6 +633,9 @@ class BackupWorker:
     def _destination_reply_target(self, project: Project, message: Message) -> int | None:
         reply = getattr(message, "reply_to", None)
         if not reply:
+            if project.settings.forum_to_channel_segments:
+                segment = self.database.forum_channel_segment(project.id, 1)
+                return int(segment["destination_header_message_id"]) if segment else None
             return None
         parent_source_id = getattr(reply, "reply_to_msg_id", None)
         if parent_source_id:
@@ -590,6 +643,11 @@ class BackupWorker:
             if copied_parent:
                 return copied_parent
         source_topic_id = getattr(reply, "reply_to_top_id", None)
+        if project.settings.forum_to_channel_segments:
+            topic_id = int(source_topic_id) if source_topic_id else 1
+            segment = self.database.forum_channel_segment(project.id, topic_id)
+            if segment:
+                return int(segment["destination_header_message_id"])
         if source_topic_id:
             return self.database.destination_topic_id(project.id, int(source_topic_id))
         return None

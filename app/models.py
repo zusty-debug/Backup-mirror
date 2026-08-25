@@ -87,6 +87,8 @@ class ProjectSettings:
     # perform one final scan, then complete if it is still idle.
     idle_stop_seconds: int = 300
     clone_forum_topics: bool = False
+    # Send selected forum topics sequentially into a normal destination channel.
+    forum_to_channel_segments: bool = False
     # Empty means every accessible topic; otherwise only these source topic IDs.
     forum_topic_ids: list[int] = field(default_factory=list)
 

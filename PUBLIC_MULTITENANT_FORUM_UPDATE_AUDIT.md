@@ -270,16 +270,42 @@ Existing test coverage verifies:
 
 ---
 
-## 15. Forum failure visibility and hardened topic mapping update
+## 15. Forum failure visibility and channel-segment alternative
 
-After a forum-clone run reported failure during `🧵 Matching forum topics`, the project card was updated to expose the recorded `last_error` directly in the bot UI. This makes future setup failures visible without requiring server-log access.
+A live forum-clone test surfaced this exact Telegram response:
 
-Topic-clone mapping was hardened by:
+```text
+PremiumAccountRequiredError
+caused by CreateForumTopicRequest
+```
 
-- using a normal fallback icon colour when a source topic has no custom icon colour;
-- extracting the destination topic root message from Telegram update results when present;
-- querying destination topics by title as a fallback when Telegram returns an update form without a root message;
-- retaining the durable topic mapping only after a destination topic ID is found.
+This means a non-Premium worker account cannot create forum topics through Telegram's client API. The implementation does not attempt to bypass that Telegram restriction.
+
+### New non-Premium forum destination mode
+
+For selected forum topics, users can now send:
+
+```text
+CREATE_CHANNEL
+```
+
+instead of `CREATE_FORUM`.
+
+The worker creates a normal broadcast destination channel. It processes selected source topics in the order the user selected them:
+
+1. posts a fresh `📌 Topic Name` header;
+2. pins that header in the destination channel;
+3. mirrors selected topic content below the header;
+4. proceeds to the next selected topic and repeats.
+
+The `forum_channel_segments` table stores the destination header message for each source topic so restarts do not create duplicate headers. Direct topic messages are attached under their relevant header; copied replies still map to copied parent messages when available.
+
+### Premium or pre-created-forum mode
+
+- `CREATE_FORUM` remains available for Premium worker accounts and performs topic creation during project setup, before a backup starts.
+- For an existing destination forum, the bot maps selected source topics to matching destination topic titles. If a topic is absent, setup stops and reports the exact missing titles before any backup run begins.
+
+Project cards now expose the exact recorded `last_error`, so API failures are visible directly in the bot UI.
 
 ## 16. Forum topic selection update
 

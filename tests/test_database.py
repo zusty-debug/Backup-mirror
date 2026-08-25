@@ -87,8 +87,12 @@ def test_forum_topic_and_admin_summaries() -> None:
     )
     database.create_project(project)
     database.save_forum_topic(project.id, 42, 142, "Movies")
+    database.save_forum_channel_segment(project.id, 42, 901, "Movies", pinned=True)
     assert database.destination_topic_id(project.id, 42) == 142
     assert database.forum_topic_count(project.id) == 1
+    segment = database.forum_channel_segment(project.id, 42)
+    assert segment["destination_header_message_id"] == 901
+    assert segment["pinned"] == 1
     summary = database.global_admin_summary()
     assert summary["users"] == 1
     assert summary["projects"] == 1

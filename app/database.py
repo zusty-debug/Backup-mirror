@@ -143,6 +143,17 @@ class Database:
                     created_at TEXT NOT NULL,
                     UNIQUE(project_id, source_topic_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS forum_channel_segments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    source_topic_id INTEGER NOT NULL,
+                    destination_header_message_id INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(project_id, source_topic_id)
+                );
                 """
             )
             self.connection.commit()
@@ -680,3 +691,36 @@ class Database:
                 """,
                 (project_id, limit),
             ).fetchall()
+
+    def save_forum_channel_segment(
+        self,
+        project_id: str,
+        source_topic_id: int,
+        destination_header_message_id: int,
+        title: str,
+        *,
+        pinned: bool,
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO forum_channel_segments(
+                    project_id, source_topic_id, destination_header_message_id, title, pinned, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, source_topic_id) DO UPDATE SET
+                  destination_header_message_id = excluded.destination_header_message_id,
+                  title = excluded.title,
+                  pinned = excluded.pinned
+                """,
+                (project_id, source_topic_id, destination_header_message_id, title, int(pinned), utcnow()),
+            )
+
+    def forum_channel_segment(self, project_id: str, source_topic_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self.connection.execute(
+                """
+                SELECT destination_header_message_id, title, pinned
+                FROM forum_channel_segments WHERE project_id = ? AND source_topic_id = ?
+                """,
+                (project_id, source_topic_id),
+            ).fetchone()

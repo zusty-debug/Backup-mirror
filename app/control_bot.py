@@ -5,7 +5,7 @@ import logging
 import re
 from dataclasses import dataclass, field, replace
 
-from telethon import Button, TelegramClient, events, functions
+from telethon import Button, TelegramClient, errors, events, functions
 from telethon.errors import RPCError
 from telethon.sessions import StringSession
 
@@ -77,7 +77,10 @@ class TelegramControlBot:
 
     async def _edit_reply(self, event, text: str, *args, **kwargs):
         kwargs.setdefault("parse_mode", "html")
-        return await event.edit(self._brand(text), *args, **kwargs)
+        try:
+            return await event.edit(self._brand(text), *args, **kwargs)
+        except errors.MessageNotModifiedError:
+            return None
 
     @staticmethod
     def _allowed(user_id: int | None) -> bool:
@@ -480,14 +483,15 @@ class TelegramControlBot:
             await event.answer("Start a new project again", alert=True)
             return
         topics = flow.data.get("forum_topics", [])
-        selected = {int(topic_id) for topic_id in flow.data.get("selected_topic_ids", [])}
+        selected = [int(topic_id) for topic_id in flow.data.get("selected_topic_ids", [])]
         if data.startswith("topic:toggle:"):
             topic_id = int(data.rsplit(":", 1)[1])
             if topic_id in selected:
                 selected.remove(topic_id)
             else:
-                selected.add(topic_id)
-            flow.data["selected_topic_ids"] = sorted(selected)
+                # Preserve the user's selection order for channel segment ordering.
+                selected.append(topic_id)
+            flow.data["selected_topic_ids"] = selected
             await self._edit_reply(
                 event,
                 "<b>🧵 Select forum topics</b>\n\nTap one or more topics, then press <b>Done</b>.",
@@ -509,7 +513,10 @@ class TelegramControlBot:
             flow.stage = "destination"
             await self._edit_reply(
                 event,
-                "🧵 Topics selected.\n\nSend <code>CREATE_FORUM</code> to create a new matching forum clone.",
+                "🧵 Topics selected.\n\n"
+                "Send <code>CREATE_CHANNEL</code> to create a normal destination channel. "
+                "The bot will post selected topics one after another with a pinned topic header.\n\n"
+                "<code>CREATE_FORUM</code> remains available only for Premium worker accounts.",
             )
 
     def _content_buttons(self, flow: Flow):
@@ -604,6 +611,69 @@ class TelegramControlBot:
             return int(match.group(1))
         return int(value) if value.strip().isdigit() and int(value) > 0 else None
 
+    async def _prepare_forum_topic_mapping(self, project: Project, *, create_missing: bool) -> None:
+        """Map selected source topics to destination topics before a run starts.
+
+        Topic creation is deliberately performed during setup rather than inside
+        the backup worker, so capability errors are reported before any copy run.
+        """
+        selected = {int(topic_id) for topic_id in project.settings.forum_topic_ids}
+        if not selected:
+            return
+        source_topics = await self.gateway.forum_topics(project.profile_id, project.source_ref)
+        destination_topics = await self.gateway.forum_topics(project.profile_id, project.destination_ref)
+        source_topics = [topic for topic in source_topics if int(topic["id"]) in selected]
+        if not source_topics:
+            raise TelegramGatewayError("The selected source forum topics are no longer accessible.")
+        destination_by_title = {str(topic["title"]).casefold(): topic for topic in destination_topics}
+        missing: list[str] = []
+        async with self.gateway.client_for_profile(project.profile_id) as client:
+            destination = await self.gateway.resolve_entity(client, project.destination_ref)
+            for topic in source_topics:
+                source_topic_id = int(topic["id"])
+                if source_topic_id == 1:
+                    self.database.save_forum_topic(project.id, 1, 1, str(topic["title"]))
+                    continue
+                existing = destination_by_title.get(str(topic["title"]).casefold())
+                if existing:
+                    self.database.save_forum_topic(project.id, source_topic_id, int(existing["id"]), str(topic["title"]))
+                    continue
+                if not create_missing:
+                    missing.append(str(topic["title"]))
+                    continue
+                try:
+                    created = await client(
+                        functions.messages.CreateForumTopicRequest(
+                            peer=destination,
+                            title=str(topic["title"]),
+                            icon_color=topic.get("icon_color") or 0x6FB9F0,
+                            icon_emoji_id=topic.get("icon_emoji_id"),
+                        )
+                    )
+                except errors.PremiumAccountRequiredError as exc:
+                    raise TelegramGatewayError(
+                        "Telegram requires a Premium worker account to create forum topics through the API. "
+                        "Create matching destination topics manually, then use that existing forum as destination."
+                    ) from exc
+                destination_topic_id = None
+                for update in getattr(created, "updates", []):
+                    new_message = getattr(update, "message", None)
+                    if new_message and getattr(new_message, "id", None):
+                        destination_topic_id = int(new_message.id)
+                        break
+                if destination_topic_id is None:
+                    refreshed = await self.gateway.forum_topics(project.profile_id, project.destination_ref)
+                    matched = next((item for item in refreshed if str(item["title"]).casefold() == str(topic["title"]).casefold()), None)
+                    destination_topic_id = int(matched["id"]) if matched else None
+                if not destination_topic_id:
+                    raise TelegramGatewayError(f"Unable to create/map destination forum topic: {topic['title']}")
+                self.database.save_forum_topic(project.id, source_topic_id, destination_topic_id, str(topic["title"]))
+        if missing:
+            raise TelegramGatewayError(
+                "Destination forum is missing these selected topics: " + ", ".join(missing) + ". "
+                "Create matching topics manually, then create the project again."
+            )
+
     async def _create_project(self, event, user_id: int, flow: Flow) -> None:
         destination_ref = str(flow.data["destination_ref"])
         settings = flow.data.get("settings", ProjectSettings())
@@ -618,24 +688,37 @@ class TelegramControlBot:
         )
         project.start_message_id = flow.data.get("start_message_id")
         try:
-            if destination_ref.upper() == "CREATE_FORUM":
+            destination_mode = destination_ref.upper()
+            if destination_mode in {"CREATE_FORUM", "CREATE_CHANNEL"}:
                 async with self.gateway.client_for_profile(project.profile_id) as client:
                     source = await self.gateway.resolve_entity(client, project.source_ref)
-                    if not getattr(source, "forum", False):
-                        raise TelegramGatewayError("CREATE_FORUM can only be used when the source is a forum group with topics.")
-                    if project.scan_mode == ScanMode.FROM_MESSAGE_ID:
+                    if project.scan_mode == ScanMode.FROM_MESSAGE_ID and getattr(source, "forum", False):
                         raise TelegramGatewayError("Custom start link/ID is not available for forum-topic copies.")
-                    created = await client(
-                        functions.channels.CreateChannelRequest(
-                            title=f"{self.gateway.entity_name(source)} Backup"[:128],
-                            about="Media mirror forum clone",
-                            megagroup=True,
-                            forum=True,
+                    if destination_mode == "CREATE_FORUM":
+                        if not getattr(source, "forum", False):
+                            raise TelegramGatewayError("CREATE_FORUM can only be used when the source is a forum group with topics.")
+                        created = await client(
+                            functions.channels.CreateChannelRequest(
+                                title=f"{self.gateway.entity_name(source)} Backup"[:128],
+                                about="Media mirror forum clone",
+                                megagroup=True,
+                                forum=True,
+                            )
                         )
-                    )
+                        project.settings = replace(project.settings, clone_forum_topics=True)
+                    else:
+                        created = await client(
+                            functions.channels.CreateChannelRequest(
+                                title=f"{self.gateway.entity_name(source)} Topics Backup"[:128],
+                                about="Sequential topic mirror channel",
+                                broadcast=True,
+                                megagroup=False,
+                            )
+                        )
+                        if getattr(source, "forum", False):
+                            project.settings = replace(project.settings, forum_to_channel_segments=True)
                     destination = created.chats[0]
                     project.destination_ref = f"-100{destination.id}"
-                    project.settings = replace(project.settings, clone_forum_topics=True)
                     self.database.create_project(project)
                     self.database.update_project_resolution(
                         project.id,
@@ -649,12 +732,25 @@ class TelegramControlBot:
                 source, destination = await self.gateway.preflight(project.profile_id, project.source_ref, project.destination_ref)
                 if project.scan_mode == ScanMode.FROM_MESSAGE_ID and getattr(source, "forum", False):
                     raise TelegramGatewayError("Custom start link/ID is available only for channels and groups with topics disabled.")
+                if getattr(source, "forum", False) and project.settings.forum_topic_ids:
+                    if getattr(destination, "forum", False):
+                        project.settings = replace(project.settings, clone_forum_topics=True)
+                    elif getattr(destination, "broadcast", False):
+                        project.settings = replace(project.settings, forum_to_channel_segments=True)
+                    else:
+                        raise TelegramGatewayError("Selected forum topics need a destination forum or a destination channel.")
+                    self.database.update_project_settings(project.id, project.settings)
                 self.database.update_project_resolution(
                     project.id,
                     int(source.id),
                     self.gateway.entity_name(source),
                     int(destination.id),
                     self.gateway.entity_name(destination),
+                )
+            if project.settings.clone_forum_topics and project.settings.forum_topic_ids:
+                await self._prepare_forum_topic_mapping(
+                    project,
+                    create_missing=destination_mode == "CREATE_FORUM",
                 )
             if project.scan_mode == ScanMode.NEW_FILES_ONLY:
                 latest = await self.gateway.latest_message_id(project.profile_id, project.source_ref)
@@ -833,6 +929,7 @@ class TelegramControlBot:
             "⚡ Transfer: Telegram server-side fresh send\n"
             f"📦 Content mode: {settings.content_mode}\n"
             f"🧵 Forum topic clone: {'On' if settings.clone_forum_topics else 'Off'}\n"
+            f"📺 Forum → channel sections: {'On' if settings.forum_to_channel_segments else 'Off'}\n"
             f"📝 Captions: {'Preserved' if settings.preserve_captions else 'Removed'}\n"
             f"🔄 Continuous sync: {'Enabled' if settings.continuous_sync else 'Disabled'}\n"
             f"⏲️ Idle stop timer: {settings.idle_stop_seconds}s\n\n"
@@ -851,6 +948,12 @@ class TelegramControlBot:
 
     @staticmethod
     def _project_card(project: Project) -> str:
+        if project.settings.forum_to_channel_segments:
+            forum_mode = "Sequential channel sections"
+        elif project.settings.clone_forum_topics:
+            forum_mode = "Forum topic clone"
+        else:
+            forum_mode = "Normal chat"
         base = (
             f"<b>📁 {TelegramControlBot._esc(project.name)}</b>\n"
             f"🔄 Status: <code>{project.status.value}</code>\n"
@@ -859,7 +962,7 @@ class TelegramControlBot:
             f"🧭 Start: {project.scan_mode.value}\n"
             f"📦 Content: {project.settings.content_mode}\n"
             "⚡ Transfer: Telegram server-side fresh send\n"
-            f"🧵 Forum topics: {'Clone enabled' if project.settings.clone_forum_topics else 'Normal chat'}\n"
+            f"🧵 Forum mode: {forum_mode}\n"
             f"📝 Captions: {'On' if project.settings.preserve_captions else 'Off'} · "
             f"🔄 Sync: {'On' if project.settings.continuous_sync else 'Off'}"
         )

@@ -29,6 +29,7 @@ def build_project_report(database: Database, project: Project, report_dir: Path)
         f"- Content mode: {project.settings.content_mode}",
         f"- Media types: {', '.join(str(item) for item in project.settings.media_types)}",
         f"- Forum topics cloned: {project.settings.clone_forum_topics}",
+        f"- Forum topics sent as channel sections: {project.settings.forum_to_channel_segments}",
         f"- Preserve captions: {project.settings.preserve_captions}",
         f"- Preserve albums: {project.settings.preserve_albums}",
         f"- Skip duplicates: {project.settings.skip_duplicates}",
