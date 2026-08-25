@@ -279,14 +279,13 @@ class BackupWorker:
             progress.phase = f"🧵 Mirroring topic: {title}"
             progress.current_file = f"Topic header pinned: {title}"
             self.database.log_event(project.id, "INFO", f"Started forum channel segment: {title}")
+            await self._status(project, progress, force=True)
             album: list[Message] = []
             album_key: int | None = None
-            # Topic processing deliberately uses the ledger for resume protection
-            # instead of a shared cross-topic checkpoint.
-            async for message in client.iter_messages(source, reverse=True, min_id=0):
+            # Telegram can fetch a forum topic thread directly. This prevents a
+            # selected-topic backup from scanning every unrelated forum message.
+            async for message in client.iter_messages(source, reverse=True, reply_to=topic_id):
                 if not self._within_date_range(project, message):
-                    continue
-                if self._forum_message_topic_id(message) != topic_id:
                     continue
                 progress.scanned += 1
                 grouped_id = getattr(message, "grouped_id", None)
