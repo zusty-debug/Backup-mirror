@@ -69,6 +69,11 @@ class BackupWorker:
                 await self._preflight(project)
                 project = self._reload(project.id)
             self.database.update_project_status(project.id, ProjectStatus.RUNNING)
+            plan = self.database.project_plan(project.id)
+            if plan:
+                progress.total_eligible = int(plan["selected_total"])
+                progress.counted_messages = int(plan["scanned_total"])
+                progress.phase = "🚀 Sending approved plan"
             self.database.log_event(project.id, "INFO", "Backup run started")
             await self._status(project, progress, force=True)
 
@@ -144,24 +149,35 @@ class BackupWorker:
         )
 
     async def preview(self, project_id: str) -> dict[str, int]:
-        """Read-only estimate of selected source content before the user starts a run."""
+        """Read-only plan scan using the exact same source selection as transfer."""
         project = self._reload(project_id)
         counts: dict[str, int] = {}
         scanned = 0
         async with self.gateway.client_for_profile(project.profile_id) as client:
             source = await self.gateway.resolve_entity(client, project.source_ref)
-            checkpoint = project.checkpoint_message_id or 0
-            min_id = max(checkpoint, (project.start_message_id or 1) - 1)
-            async for message in client.iter_messages(source, reverse=True, min_id=min_id):
-                if not self._within_date_range(project, message) or not self._message_in_selected_topic(project, message):
-                    continue
-                scanned += 1
-                kind = self._eligible_media(project, message)
-                if kind:
-                    counts[kind.value] = counts.get(kind.value, 0) + 1
+            if getattr(source, "forum", False) and project.settings.forum_to_channel_segments:
+                topic_ids = [int(topic_id) for topic_id in project.settings.forum_topic_ids]
+                for topic_id in topic_ids:
+                    async for message in client.iter_messages(source, reverse=True, reply_to=topic_id):
+                        if not self._within_date_range(project, message):
+                            continue
+                        scanned += 1
+                        kind = self._eligible_media(project, message)
+                        if kind:
+                            counts[kind.value] = counts.get(kind.value, 0) + 1
+            else:
+                checkpoint = project.checkpoint_message_id or 0
+                min_id = max(checkpoint, (project.start_message_id or 1) - 1)
+                async for message in client.iter_messages(source, reverse=True, min_id=min_id):
+                    if not self._within_date_range(project, message) or not self._message_in_selected_topic(project, message):
+                        continue
+                    scanned += 1
+                    kind = self._eligible_media(project, message)
+                    if kind:
+                        counts[kind.value] = counts.get(kind.value, 0) + 1
         counts["SCANNED"] = scanned
         counts["TOTAL"] = sum(value for key, value in counts.items() if key != "SCANNED")
-        self.database.log_event(project.id, "INFO", f"Preview scan: {counts['TOTAL']} selected items found")
+        self.database.log_event(project.id, "INFO", f"Preview plan scan: {counts['TOTAL']} selected items found")
         return counts
 
     async def _run_single_pass(self, project: Project, progress: ScanProgress) -> None:
@@ -999,8 +1015,8 @@ class BackupWorker:
             f"{progress_bar + chr(10) if progress_bar else ''}"
             f"🔎 Source messages scanned: {progress.scanned:,}\n"
             f"🎞️ Media/files found: {progress.eligible:,}\n"
-            f"✅ Copied: {counters.completed:,}\n"
-            f"⏭️ Skipped: {progress.skipped:,}\n"
+            f"✅ Sent: {counters.completed:,}\n"
+            f"♻️ Already copied (resume protection): {progress.skipped:,}\n"
             f"⚠️ Failed: {max(counters.failed, progress.failed_this_run):,}\n"
             f"📦 Media reused: {readable_bytes(counters.bytes_transferred)}\n"
             f"⚡ Effective speed: {readable_bytes(speed)}/s\n"

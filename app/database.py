@@ -154,6 +154,14 @@ class Database:
                     created_at TEXT NOT NULL,
                     UNIQUE(project_id, source_topic_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS project_plans (
+                    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                    selected_total INTEGER NOT NULL,
+                    scanned_total INTEGER NOT NULL,
+                    breakdown_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             self.connection.commit()
@@ -339,6 +347,7 @@ class Database:
                 "UPDATE projects SET settings_json = ?, updated_at = ? WHERE id = ?",
                 (settings.to_json(), utcnow(), project_id),
             )
+            conn.execute("DELETE FROM project_plans WHERE project_id = ?", (project_id,))
 
     def update_project_checkpoint(self, project_id: str, message_id: int) -> None:
         with self.transaction() as conn:
@@ -735,3 +744,37 @@ class Database:
                 (chat_id, message_id),
             ).fetchone()
         return self._project_from_row(row) if row else None
+
+    def save_project_plan(self, project_id: str, scanned_total: int, selected_total: int, breakdown: dict[str, int]) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO project_plans(project_id, selected_total, scanned_total, breakdown_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                  selected_total = excluded.selected_total,
+                  scanned_total = excluded.scanned_total,
+                  breakdown_json = excluded.breakdown_json,
+                  created_at = excluded.created_at
+                """,
+                (project_id, selected_total, scanned_total, json.dumps(breakdown, sort_keys=True), utcnow()),
+            )
+
+    def project_plan(self, project_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT selected_total, scanned_total, breakdown_json, created_at FROM project_plans WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "selected_total": int(row["selected_total"]),
+            "scanned_total": int(row["scanned_total"]),
+            "breakdown": json.loads(row["breakdown_json"]),
+            "created_at": row["created_at"],
+        }
+
+    def clear_project_plan(self, project_id: str) -> None:
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM project_plans WHERE project_id = ?", (project_id,))

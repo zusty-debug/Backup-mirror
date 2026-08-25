@@ -344,6 +344,23 @@ Content selection is now multi-select instead of a single fixed choice.
 
 ## 19. Live status refresh, progress bar, and rate-protection wording
 
+### Scan → approval → send workflow
+
+A project now uses a deliberate two-step workflow:
+
+```text
+🔍 Scan Selected Content
+→ show exact valid selected total and type breakdown
+→ user presses ▶️ Start Sending N Items
+→ transfer begins
+```
+
+The scan result is stored in `project_plans`, including scanned source count, approved selected total, type breakdown, and plan timestamp. Transfer status uses this plan total for an exact progress percentage and ETA.
+
+If a project has not been scanned, pressing Start prompts the user to scan first rather than sending immediately.
+
+`Skipped` is now shown as `Already copied (resume protection)`, clarifying that it only applies to durable restart/retry deduplication and not to newly approved source messages.
+
 ### Direct topic-thread retrieval
 
 The first channel-segment implementation scanned the full forum history and filtered for selected-topic messages. This could delay delivery where a forum had a large unrelated history.

@@ -212,6 +212,18 @@ class TelegramControlBot:
             if not self.gateway.has_session(user_id):
                 await event.answer("Connect worker account first", alert=True)
                 return
+            if not self.database.project_plan(project.id):
+                await event.answer("Scan selected content first")
+                await self._edit_reply(
+                    event,
+                    f"<b>🧮 Scan required — {self._esc(project.name)}</b>\n\n"
+                    "First count every valid selected source message. Then the bot will show the exact total and ask for final sending confirmation.",
+                    buttons=[
+                        [Button.inline("🔍 Scan Selected Content", f"preview:{project.id}".encode())],
+                        [Button.inline("⬅️ Project", f"view:{project.id}".encode())],
+                    ],
+                )
+                return
             status = await self.client.send_message(
                 event.chat_id,
                 self._brand(f"<b>📡 Live backup status</b>\n📁 Project: <b>{self._esc(project.name)}</b>\n🚀 Preparing…"),
@@ -278,16 +290,27 @@ class TelegramControlBot:
                 counts = await self.workers.worker.preview(project.id)
                 total = counts.pop("TOTAL", 0)
                 scanned = counts.pop("SCANNED", 0)
-                breakdown = "\n".join(f"• {self._esc(kind.title().replace('_', ' '))}: {amount:,}" for kind, amount in sorted(counts.items()))
-                text = (
-                    f"<b>🔍 Preview — {self._esc(project.name)}</b>\n\n"
-                    f"🔎 Source messages scanned: {scanned:,}\n"
-                    f"📦 Selected content: {total:,}\n\n"
-                    f"{breakdown or 'No selected content found.'}\n\n"
-                    "No messages were sent during this preview."
+                self.database.save_project_plan(project.id, scanned, total, counts)
+                breakdown = "\n".join(
+                    f"• {self._esc(kind.title().replace('_', ' '))}: {amount:,}"
+                    for kind, amount in sorted(counts.items())
                 )
-                self.database.log_event(project.id, "INFO", f"Preview displayed: {total} selected items")
-                await self._edit_reply(event, text, buttons=[[Button.inline("⬅️ Project", f"view:{project.id}".encode())]])
+                text = (
+                    f"<b>🧮 Sending plan ready — {self._esc(project.name)}</b>\n\n"
+                    f"🔎 Source messages scanned: {scanned:,}\n"
+                    f"📦 Valid selected messages: <b>{total:,}</b>\n\n"
+                    f"{breakdown or 'No selected content found.'}\n\n"
+                    "No messages have been sent. Review the total, then press Start Sending."
+                )
+                self.database.log_event(project.id, "INFO", f"Sending plan approved: {total} selected items")
+                await self._edit_reply(
+                    event,
+                    text,
+                    buttons=[
+                        [Button.inline(f"▶️ Start Sending {total:,} Items", f"start:{project.id}".encode())],
+                        [Button.inline("🔍 Scan Again", f"preview:{project.id}".encode()), Button.inline("⬅️ Project", f"view:{project.id}".encode())],
+                    ],
+                )
             except Exception as exc:
                 self.database.log_event(project.id, "ERROR", f"Preview failed: {exc}")
                 await event.answer(f"Preview failed: {truncate(str(exc), 90)}", alert=True)
@@ -826,8 +849,8 @@ class TelegramControlBot:
             f"🔄 State: <code>{state}</code>\n"
             f"📍 Phase: {self._esc(phase)}\n\n"
             f"{progress_line}\n"
-            f"✅ Copied: {counters.completed:,}\n"
-            f"⏭️ Skipped: {progress.skipped if progress else 0:,}\n"
+            f"✅ Sent: {counters.completed:,}\n"
+            f"♻️ Already copied: {progress.skipped if progress else 0:,}\n"
             f"⚠️ Failed: {counters.failed:,}\n"
             f"📦 Media reused: {readable_bytes(counters.bytes_transferred)}\n"
             f"⏱️ Elapsed: {elapsed}s\n"

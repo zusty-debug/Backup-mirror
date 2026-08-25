@@ -95,6 +95,11 @@ def test_forum_topic_and_admin_summaries() -> None:
     segment = database.forum_channel_segment(project.id, 42)
     assert segment["destination_header_message_id"] == 901
     assert segment["pinned"] == 1
+    database.save_project_plan(project.id, 120, 85, {"DOCUMENT": 80, "TEXT": 5})
+    plan = database.project_plan(project.id)
+    assert plan["scanned_total"] == 120
+    assert plan["selected_total"] == 85
+    assert plan["breakdown"]["DOCUMENT"] == 80
     summary = database.global_admin_summary()
     assert summary["users"] == 1
     assert summary["projects"] == 1
