@@ -49,6 +49,9 @@ class TelegramControlBot:
             device_model="Telegram Media Mirror Control Bot",
             system_version="Linux",
             app_version="0.1.0",
+            connection_retries=10,
+            retry_delay=3,
+            auto_reconnect=True,
         )
         self.flows: dict[int, Flow] = {}
         self.plan_scan_tasks: dict[str, asyncio.Task[None]] = {}
@@ -56,11 +59,33 @@ class TelegramControlBot:
         self.client.add_event_handler(self._on_callback, events.CallbackQuery())
 
     async def start(self) -> None:
-        await self.client.start(bot_token=self.settings.bot_token)
-        me = await self.client.get_me()
-        logger.info("Telegram Media Mirror Bot started as @%s", me.username)
-        await self.workers.resume_after_restart()
-        await self.client.run_until_disconnected()
+        """Keep the control bot alive across temporary hosting/network outages."""
+        reconnect_delay = 5
+        resumed_workers = False
+        while True:
+            try:
+                await self.client.start(bot_token=self.settings.bot_token)
+                me = await self.client.get_me()
+                logger.info("Telegram Media Mirror Bot connected as @%s", me.username)
+                if not resumed_workers:
+                    await self.workers.resume_after_restart()
+                    resumed_workers = True
+                reconnect_delay = 5
+                await self.client.run_until_disconnected()
+                # A normal explicit disconnect means application shutdown.
+                return
+            except (TimeoutError, ConnectionError, OSError) as exc:
+                logger.warning(
+                    "Telegram network unavailable (%s). Retrying control bot connection in %ss.",
+                    exc.__class__.__name__,
+                    reconnect_delay,
+                )
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 60)
 
     async def close(self) -> None:
         if self.client.is_connected():

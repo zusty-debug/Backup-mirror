@@ -56,6 +56,9 @@ class TelegramGateway:
             device_model="Telegram Media Mirror Bot",
             system_version="Linux",
             app_version="0.1.0",
+            connection_retries=10,
+            retry_delay=3,
+            auto_reconnect=True,
         )
 
     async def begin_login(self, owner_id: int, phone: str) -> str:

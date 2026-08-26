@@ -372,6 +372,22 @@ If a project has not been scanned, pressing Start prompts the user to scan first
 - During a FloodWait, two separate bars are shown: overall approved-message progress and a countdown bar for Telegram's pacing window.
 - Every live backup card retains a `🔄 Refresh Live Status` button for an immediate snapshot, while automatic updates continue every two seconds.
 
+### Telegram network resilience
+
+A JustRunMy runtime diagnostic showed the control client exiting after five connection timeouts to Telegram's MTProto endpoint:
+
+```text
+ConnectionError: Connection to Telegram failed 5 time(s)
+```
+
+The control-bot client and worker-session clients now use larger Telethon retry settings. The control bot additionally remains alive in an exponential reconnect loop:
+
+```text
+5 seconds → 10 → 20 → 40 → 60 seconds maximum
+```
+
+Temporary Telegram/network outages no longer cause the application process to exit. Once connectivity returns, the same container reconnects and continues serving bot commands. Workers are resumed only once after the first successful control-bot connection.
+
 ### Adaptive per-worker pace control
 
 Worker pacing is persisted in `worker_pacing` by worker profile. The adaptive schedule is:
