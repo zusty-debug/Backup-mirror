@@ -386,6 +386,8 @@ The control-bot client and worker-session clients now use larger Telethon retry 
 5 seconds → 10 → 20 → 40 → 60 seconds maximum
 ```
 
+A JustRunMy runtime test showed that the host timed out using Telethon's normal TCP Full transport, while an obfuscated MTProto transport connected successfully. Both the control bot and worker-session clients now use `ConnectionTcpObfuscated` over port 443.
+
 Temporary Telegram/network outages no longer cause the application process to exit. Once connectivity returns, the same container reconnects and continues serving bot commands. Workers are resumed only once after the first successful control-bot connection.
 
 ### Adaptive per-worker pace control

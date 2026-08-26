@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from telethon import TelegramClient, errors, functions, types
+from telethon.network.connection.tcpobfuscated import ConnectionTcpObfuscated
 from telethon.sessions import StringSession
 
 from .config import Settings
@@ -56,6 +57,7 @@ class TelegramGateway:
             device_model="Telegram Media Mirror Bot",
             system_version="Linux",
             app_version="0.1.0",
+            connection=ConnectionTcpObfuscated,
             connection_retries=10,
             retry_delay=3,
             auto_reconnect=True,
