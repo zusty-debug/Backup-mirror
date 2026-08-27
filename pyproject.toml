@@ -12,6 +12,7 @@ license = {text = "MIT"}
 authors = [{name = "Telegram Media Mirror Bot"}]
 dependencies = [
   "telethon>=1.37,<2",
+  "python-socks[asyncio]>=2.6,<3",
   "pydantic-settings>=2.5,<3",
   "cryptography>=43,<46",
   "python-dotenv>=1.0,<2",

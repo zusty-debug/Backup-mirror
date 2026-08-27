@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, replace
 
 from telethon import Button, TelegramClient, errors, events, functions
 from telethon.errors import RPCError
+from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 from telethon.network.connection.tcpobfuscated import ConnectionTcpObfuscated
 from telethon.sessions import StringSession
 
@@ -43,6 +44,7 @@ class TelegramControlBot:
         self.database = database
         self.gateway = gateway
         self.workers = workers
+        mtproxy = settings.mtproxy
         self.client = TelegramClient(
             StringSession(),
             settings.telegram_api_id,
@@ -50,7 +52,8 @@ class TelegramControlBot:
             device_model="Telegram Media Mirror Control Bot",
             system_version="Linux",
             app_version="0.1.0",
-            connection=ConnectionTcpObfuscated,
+            connection=ConnectionTcpMTProxyRandomizedIntermediate if mtproxy else ConnectionTcpObfuscated,
+            proxy=mtproxy,
             connection_retries=10,
             retry_delay=3,
             auto_reconnect=True,

@@ -390,6 +390,12 @@ A JustRunMy runtime test showed that the host timed out using Telethon's normal 
 
 Temporary Telegram/network outages no longer cause the application process to exit. Once connectivity returns, the same container reconnects and continues serving bot commands. Workers are resumed only once after the first successful control-bot connection.
 
+### MTProxy fallback for restricted hosts
+
+When `TELEGRAM_MTPROXY_HOST`, `TELEGRAM_MTPROXY_PORT`, and `TELEGRAM_MTPROXY_SECRET` are configured together, both the control bot and every worker session use Telethon's `ConnectionTcpMTProxyRandomizedIntermediate` transport. This is the correct MTProxy transport for `dd`-prefixed secrets.
+
+The configured clear-net MTProxy connection was validated independently before deployment. This provides an outbound route for hosts where direct Telegram MTProto connections time out.
+
 ### Adaptive per-worker pace control
 
 Worker pacing is persisted in `worker_pacing` by worker profile. The adaptive schedule is:

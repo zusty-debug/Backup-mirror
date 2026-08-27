@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from telethon import TelegramClient, errors, functions, types
+from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 from telethon.network.connection.tcpobfuscated import ConnectionTcpObfuscated
 from telethon.sessions import StringSession
 
@@ -50,6 +51,7 @@ class TelegramGateway:
         self._challenge_lock = asyncio.Lock()
 
     def _new_client(self, session: str = "") -> TelegramClient:
+        mtproxy = self.settings.mtproxy
         return TelegramClient(
             StringSession(session),
             self.settings.telegram_api_id,
@@ -57,7 +59,8 @@ class TelegramGateway:
             device_model="Telegram Media Mirror Bot",
             system_version="Linux",
             app_version="0.1.0",
-            connection=ConnectionTcpObfuscated,
+            connection=ConnectionTcpMTProxyRandomizedIntermediate if mtproxy else ConnectionTcpObfuscated,
+            proxy=mtproxy,
             connection_retries=10,
             retry_delay=3,
             auto_reconnect=True,

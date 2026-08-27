@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     encryption_key: str = Field(alias="ENCRYPTION_KEY", min_length=32)
     owner_ids: OwnerIds = Field(alias="OWNER_IDS")
 
+    # Optional Telegram MTProxy transport used when a host cannot reach
+    # Telegram's direct MTProto endpoints.
+    telegram_mtproxy_host: str | None = Field(default=None, alias="TELEGRAM_MTPROXY_HOST")
+    telegram_mtproxy_port: int | None = Field(default=None, alias="TELEGRAM_MTPROXY_PORT", ge=1, le=65535)
+    telegram_mtproxy_secret: str | None = Field(default=None, alias="TELEGRAM_MTPROXY_SECRET")
+
     data_dir: Path = Field(default=Path("./data"), alias="DATA_DIR")
     database_path: Path = Field(default=Path("./data/mirror.db"), alias="DATABASE_PATH")
     temp_dir: Path = Field(default=Path("./data/tmp"), alias="TEMP_DIR")
@@ -45,6 +51,15 @@ class Settings(BaseSettings):
     max_active_projects_per_user: int = Field(default=1, alias="MAX_ACTIVE_PROJECTS_PER_USER", ge=1, le=10)
     max_upload_retries: int = Field(default=4, alias="MAX_UPLOAD_RETRIES", ge=1, le=10)
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+    @property
+    def mtproxy(self) -> tuple[str, int, str] | None:
+        values = (self.telegram_mtproxy_host, self.telegram_mtproxy_port, self.telegram_mtproxy_secret)
+        if not any(values):
+            return None
+        if not all(values):
+            raise ValueError("Set TELEGRAM_MTPROXY_HOST, TELEGRAM_MTPROXY_PORT, and TELEGRAM_MTPROXY_SECRET together")
+        return str(self.telegram_mtproxy_host), int(self.telegram_mtproxy_port), str(self.telegram_mtproxy_secret)
 
     def prepare_directories(self) -> None:
         for directory in (self.data_dir, self.temp_dir, self.report_dir):
