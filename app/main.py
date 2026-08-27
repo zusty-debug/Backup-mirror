@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 from contextlib import suppress
 
@@ -40,6 +41,7 @@ async def run() -> None:
     database.initialize()
     retryable = database.cleanup_incomplete_items()
     removed = cleanup_temp_directory(settings)
+    logger.info("Application build reference: %s", os.getenv("APP_BUILD_REF", "local"))
     logger.info("Startup recovery prepared %s incomplete transfers and removed %s temporary paths", retryable, removed)
 
     gateway = TelegramGateway(settings, database, SecretBox(settings.encryption_key))

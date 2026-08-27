@@ -27,4 +27,8 @@ jobs:
         with:
           context: .
           push: true
-          tags: jdr-d62ra75i.justrunmy.app/d62ra75i:v1_autodeploy
+          build-args: |
+            APP_BUILD_REF=${{ github.sha }}
+          tags: |
+            jdr-d62ra75i.justrunmy.app/d62ra75i:v1_autodeploy
+            jdr-d62ra75i.justrunmy.app/d62ra75i:sha-${{ github.sha }}
